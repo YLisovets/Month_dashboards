@@ -1,0 +1,128 @@
+---
+title: "Отчет по В2B за `r lubridate::month(lubridate::today() - months(1), label = TRUE, abbr = FALSE)`"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: scroll
+    theme:
+      version: 4
+      navbar-bg: "red"
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(tidyverse)
+library(lubridate)
+library(reactable)
+```
+
+```{r}
+source("global.R", local = FALSE)
+rm(list = ls(pattern = "tbl", all.names = TRUE))
+
+date_start <- floor_date(today(), unit = "month") - months(1)
+date_finish <- date_start + months(1)
+
+sale_plan_df <- sale_plan_data(date_start + years(2000),
+                          date_finish + years(2000)) %>% 
+    filter(project == "Сервис")
+
+sale_data <- sale_data_global(date_start + years(2000) - months(35),
+                              date_finish + years(2000)) %>% 
+    filter(project %in% c("Новый клиент", "Сервис", "Сервіс ГОТІВКА",
+                          "Интернет-магазин Серв", "Тендер Сервіс",
+                          "Тендер ПРОЗОРО відкриті торги"),
+           !subdiv_name %in% c("Бухгалтерия", "Відділ складської логістики")
+           ) %>% 
+    mutate(subdiv_name = str_replace(subdiv_name, "роздріб", "сервіс"),
+           date_sale_doc = as.Date(date_sale_doc) - years(2000),
+           date_cust_order_doc = as.Date(date_cust_order_doc) - years(2000))
+
+returns_data <- refund_data(date_start + years(2000) - months(35),
+                            today() + years(2000)) %>% 
+    mutate(date_refund_doc = as.Date(date_refund_doc) - years(2000),
+           date_sale_doc = as.Date(date_sale_doc) - years(2000)) %>% 
+    filter(date_sale_doc >= date_start - months(35),
+           date_sale_doc < date_finish) %>% 
+    group_by(nmbr_sale_doc, date_sale_doc) %>% 
+    summarise(sum_refund = sum(item_sum))
+
+retail_customers <- data.frame(customer_id = unique(sale_data$customer_id)) %>%
+    left_join(ref_customers) %>% 
+    filter(is.na(customer_type) & edrp_code == "") %>% 
+    pull(customer_id)
+
+sale_total <- sale_data %>% 
+    
+    # Добавляем возвраты
+    left_join(returns_data) %>% 
+    replace_na(list(sum_refund = 0)) %>% 
+    mutate(doc_sum = doc_sum - sum_refund) %>%
+    
+    # Удаляем документы, по которым возвраты на ту же сумму
+    filter(doc_sum > 0)
+
+total_month_plan <- sum(sale_plan_df$saleplan_doc_sum)
+total_month_act <- sum(sale_total$doc_sum[sale_total$date_sale_doc >= date_start])
+```
+
+
+Продажи {data-icon="fa-file-invoice-dollar"}
+=======================================================================
+
+Row {data-height=150}
+-----------------------------------------------------------------------
+
+### Продажи общие - `r round(total_month_act / 1000000, 2)`млн.грн  
+
+```{r}
+gauge(round(total_month_act / total_month_plan, 1), min = 0, max = 100,
+      symbol = '%', gaugeSectors(
+           success = c(95, 100), warning = c(80, 94.9), danger = c(0, 79.9))
+)
+```
+
+### Традиционный - `r round(total_month_act / 1000000, 2)`млн.грн  {data-height=50}
+
+```{r}
+gauge(round(total_month_act / total_month_plan, 1), min = 0, max = 100,
+      symbol = '%', gaugeSectors(
+           success = c(95, 100), warning = c(80, 94.9), danger = c(0, 79.9))
+)
+```
+
+
+Row {data-height=400}
+-----------------------------------------------------------------------
+
+### Ежемесячные продажи за последние 3года (млн.грн)) {data-width=400}
+
+```{r}
+library(timetk)
+sale_total %>% 
+    summarise_by_time(date_sale_doc, .by = "month", sales = sum(doc_sum)) %>% 
+    plot_time_series(date_sale_doc, sales, .facet_ncol = 2, .smooth_span = 1,
+                     .smooth_period = "auto",
+                     .facet_scales = "free",
+                     .title = "",
+                     .interactive = TRUE)
+```
+
+Row
+-----------------------------------------------------------------------
+
+### Данные {data-width=1000}
+
+
+Покупатели {data-icon="fa-users"}
+=======================================================================
+
+Row {data-height=150}
+-----------------------------------------------------------------------
+
+
+Ассортиент {data-icon="fa-dolly"}
+=======================================================================
+
+Row {data-height=150}
+-----------------------------------------------------------------------
