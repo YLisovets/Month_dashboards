@@ -1,0 +1,2287 @@
+---
+title: "Звіт з логістики за `r lubridate::month(lubridate::rollback(Sys.Date()), label = TRUE, abbr = FALSE)`"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: scroll
+    theme:
+      version: 4
+      navbar-bg: "red"
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(tidyverse)
+library(lubridate)
+library(plotly)
+```
+
+```{r preparation}
+source("global.R", local = FALSE)
+rm(list = ls(pattern = "tbl", all.names = TRUE))
+
+date_start <-  rollback(Sys.Date(), roll_to_first = TRUE) - months(1) #as.Date("2022-02-01")
+date_finish <- date_start + months(1)
+reporting_month <- month(date_start, label = TRUE)
+date_start_year <- floor_date(date_start,unit = "year")
+
+date_for_balance <- seq.Date(date_start_year, date_finish, by = "month")
+
+available_level_fn <- function(data) {
+    df <- data %>% 
+        summarise(zero_days_items = sum(item_day_balance == 0, na.rm = TRUE),
+                  total_days_items = n(),
+                  av_lev = 1 - round(zero_days_items / total_days_items, 3))
+    
+    return(df)
+}
+
+## Логистические затраты
+expenses_raw <- expenses_data(date_start_year + years(2000),
+                              date_finish + years(2000)) %>%
+    filter(expItems_id != "100000421") %>%
+    left_join(select(distinct(ref_subdiv, subdiv_name, .keep_all = TRUE),
+                         subdiv_name, subdiv_parent),
+              by = "subdiv_name") %>% 
+    left_join(select(distinct(ref_subdiv, subdiv_name, .keep_all = TRUE), 
+                         subdiv_name, parent_2 = subdiv_parent),
+                  by = c("subdiv_parent" = "subdiv_name")) %>%
+    left_join(select(ref_expenses, expItems_id, expItems_name, expItems_parent),
+              by = c("expItems_id", "expItems_name")) %>%
+    filter(subdiv_name != "Відділ закупок",
+           subdiv_parent == "Департамент логістики" |
+               parent_2 == "Департамент логістики" |
+               expItems_parent %in% c("08 Автовитрати, запчастини",
+                                      "081 Доставка товару",
+                                      "09 Витрати на пальне")) %>% 
+    mutate(exp_sum = ifelse(type_exp == 0,
+                                exp_sum + exp_vat,
+                                -(exp_sum + exp_vat)),
+           month = month(date))
+
+## З/п водителей торговых подразделений
+drivers_in_trade_subdiv_salary_data <- tibble(
+    start_month = date_for_balance[-length(date_for_balance)],
+    end_month = date_for_balance[-1]) %>% 
+    mutate(data = map2(start_month + years(2000),
+                       end_month + years(2000),
+                       salary_data),
+           month = month(start_month)) %>% 
+    select(month, data) %>% 
+    unnest(cols = c(data)) %>% 
+    filter(position_id %in% c("000000041", "000000039"),
+           !subdiv_name %in% c("Відділ транспортної логістики",
+                              "Логістика, Луцьк"))
+
+## Продажи общие
+sale_raw <- sale_data_total(date_start_year + years(2000),
+                           date_finish + years(2000)) %>% 
+    filter(!project %in% "Оказание услуг") %>% 
+    mutate(month = month(date))
+
+## Продажи с заказами
+sale_with_orders <- sale_data_global(date_start  + years(2000) - months(1),
+                                     date_finish + years(2000)) %>% 
+    filter(!project %in% "Оказание услуг")
+
+## Заказы на доставку
+delivery_order_raw <- delivery_order_data(date_start  + years(2000) - months(1),
+                                          date_finish + years(2000))
+
+## Наряды на сборку
+product_assembly_raw <- assembly_data(date_start  + years(2000) - months(1),
+                                      date_finish + years(2000)) %>% 
+    group_by(nmbr_assembly, date_assembly) %>% 
+    summarise(items_qty = n(),
+              units_qty = sum(item_qty),
+              time_start = first(time_start),
+              time_finish = last(time_finish),
+              picker = first(user_id),
+              nmbr_deliv_order = first(nmbr_deliv_order),
+              date_deliv_order = first(date_deliv_order)) %>% 
+    ungroup()
+
+## Маршрутные листы
+route_sheet_raw <- route_sheet_data(date_start  + years(2000),
+                                    date_finish + years(2000)) %>% 
+    filter(!is.na(nmbr_deliv_order))
+
+## Закрытие заказов покупателей
+closing_customer_order_raw <- closing_customer_order(date_start  + years(2000),
+                                                     date_finish + years(2000) +
+                                                         days(7))
+
+## Рекламации
+reclamation_raw <- reclamation_data(date_start  + years(2000),
+                                    date_finish + years(2000) + days(2)) %>% 
+    filter(!is.na(nmbr_moving_out)) %>% 
+    select(-c(nmbr_receipt, date_receipt))
+
+## Внутренние перемещения
+moving_out_in_delivery <- delivery_data(date_start  + years(2000),
+                                        date_finish + years(2000)) %>% 
+    select(act_date_delivery = date_delivery, 
+           nmbr_deliv_order, date_deliv_order) %>% 
+    left_join(select(delivery_order_raw, nmbr_deliv_order, date_deliv_order,
+                     nmbr_moving_out, date_moving_out, date_delivery),
+              by = c("nmbr_deliv_order", "date_deliv_order")) %>% 
+    filter(!is.na(nmbr_moving_out)) %>%
+    left_join(product_assembly_raw,
+              by = c("nmbr_deliv_order", "date_deliv_order")) %>% 
+    left_join(reclamation_raw, by = c("nmbr_moving_out", "date_moving_out"))
+
+## Поступления товаров
+df_receipt <- receipt_data(date_start + years(2000),
+                           date_finish + years(2000)) %>% 
+    filter(!str_detect(supplier_contract, pattern = "^6851."),
+           !store_name %in% c("ГС Старокостянтинів ОЦе кава Планета",
+                              "Склад відділу штемпельної продукції"),
+           !is.na(item_id))
+
+## Развозки
+delivery_raw <- delivery_data(date_start + years(2000),
+                              date_finish + years(2000))
+
+## Багажки
+laggage_raw <- laggage_data(date_start + years(2000) - months(1),
+                            date_finish + years(2000))
+
+## Отработанное время
+work_time_df <- work_time_data(date_start + years(2000),
+                               date_finish + years(2000))
+
+## Зарплата сотрудников
+current_month_salary <- salary_data(date_start + years(2000),
+                                    date_finish + years(2000))
+
+## Приемки
+df_inspection <- inspection_data(date_start + years(2000),
+                                 date_finish + years(2000))
+
+store_space_workload_fn <- function(store) {
+    
+    df_moving_out <- moving_out_data(store,
+                                     date_start + years(2000),
+                                     date_finish + years(2000))
+    
+    not_delivered_doc <- delivery_order_raw %>% 
+    filter(store_id == store,
+           as.Date(time_finish) >= date_finish + years(2000))
+
+    not_delivered_sale_doc_items <- not_delivered_doc %>% 
+        filter(!is.na(nmbr_sale_doc)) %>% 
+        left_join(select(sale_raw, sale_doc_nmbr, date, item_id, item_qty),
+              by = c("nmbr_sale_doc" = "sale_doc_nmbr",
+                     "date_sale_doc" = "date")) %>% 
+        select(item_id, item_qty_sale = item_qty)
+ 
+    not_delivered_moving_doc_items <- not_delivered_doc %>% 
+        filter(!is.na(nmbr_moving_out)) %>% 
+        left_join(select(df_moving_out, nmbr_moving_out, date_moving_out,
+                         item_id, item_qty),
+                  by = c("nmbr_moving_out", "date_moving_out")) %>% 
+    select(item_id, item_qty_moving = item_qty)       
+
+    not_delivered_items <- full_join(not_delivered_sale_doc_items,
+                                     not_delivered_moving_doc_items,
+                                     by = "item_id") %>% 
+        replace_na(list(item_qty_sale = 0, item_qty_moving = 0)) %>% 
+        mutate(not_deliv_item_qty = item_qty_sale + item_qty_moving)
+    
+    inventory_space <- inventory_store_data(store,
+                                            date_finish + years(2000)) %>% 
+        full_join(select(not_delivered_items, item_id, not_deliv_item_qty),
+                  by = "item_id") %>% 
+        replace_na(list(item_qty = 0, not_deliv_item_qty = 0)) %>% 
+        mutate(total_item_qty = item_qty + not_deliv_item_qty) %>% 
+        left_join(select(ref_items, item_id, width, height, depth)) %>% 
+        mutate(item_volume = total_item_qty * width * height * depth / 
+                   (1000*1000*1000)) %>% 
+        summarise(total_items_space = sum(item_volume)) %>% 
+        pull()
+
+    store_space <- ref_shelf %>% 
+        filter(store_id == store) %>% 
+        mutate(shelf_space = width * height * depth / (100*100*100)) %>% 
+        summarise(sum(shelf_space)) %>% 
+        pull
+    
+    result <- tibble(store_space = store_space,
+                     inventory_space = inventory_space) %>% 
+        mutate(store_workload = round(inventory_space / store_space, 2))
+    
+    return(result)
+}
+```
+
+```{r main_indicator}
+drivers_in_trade_subdiv_salary_month <-  drivers_in_trade_subdiv_salary_data %>%
+    group_by(month) %>% 
+    summarise(exp_sum = sum(total_salary))
+
+month_expenses <- expenses_raw %>%
+    select(month, exp_sum) %>% 
+    bind_rows(drivers_in_trade_subdiv_salary_month) %>% 
+    group_by(month) %>% 
+    summarise(total_month_exp = sum(exp_sum))
+
+sale_month <- sale_raw %>% 
+    group_by(month) %>% 
+    summarise(total_sale = sum(item_sum) + sum(item_vat),
+              total_qty = sum(item_qty))
+
+total_exp_share <- sale_month %>% 
+    left_join(month_expenses, by = "month") %>% 
+    mutate(exp_share = round(total_month_exp / total_sale, 3),
+           exp_per_units_sold = round(total_month_exp / total_qty, 2))
+
+logistic_exp_share_cur_month <- total_exp_share$exp_share[month =
+                                                              month(date_start)]
+logistic_exp_per_unit <- total_exp_share$exp_per_units_sold[month =
+                                                              month(date_start)]
+
+fig1 <- total_exp_share %>% 
+    ggplot(aes(x = month, y = exp_share, group = 1)) + 
+    geom_line(size = 1.5, color = "steelblue") +
+    geom_point(shape = 21, size = 3, fill = "steelblue") +
+    scale_y_continuous(label = scales::percent) +
+    theme_minimal() +
+    labs(y = "",
+         x = "",
+         title = "")
+
+fig2 <- total_exp_share %>% 
+    ggplot(aes(x = month, y = exp_per_units_sold, group = 1)) + 
+    geom_line(size = 1.5, color = "steelblue") +
+    geom_point(shape = 21, size = 3, fill = "steelblue") +
+    theme_minimal() +
+    labs(y = "",
+         x = "",
+         title = "")
+
+
+sale_cur_month <- sale_raw %>% 
+    filter(month == month(date_start)) %>% 
+    left_join(select(ref_subdiv, subdiv_name, subdiv_parent),
+              by = "subdiv_name") %>% 
+    filter(subdiv_parent %in% c("КОРВЕТ", "Регіональні магазини")) %>% 
+    mutate(store = ifelse(!is.na(check_store),
+                          check_store,
+                          sale_doc_store),
+           sale_doc = ifelse(!is.na(check_nmbr),
+                             check_nmbr,
+                             sale_doc_nmbr)) %>% 
+    filter(!is.na(store)) %>% 
+    group_by(subdiv_id, store, sale_doc, item_id) %>% 
+    summarise(item_qty = sum(item_qty),
+              item_sum = sum(item_sum) + sum(item_vat)) %>% 
+    ungroup() %>% 
+    filter(item_qty > 0) %>% 
+    group_by(store, item_id) %>% 
+    summarise(item_purch_qty = n(),
+              item_total_sum = sum(item_sum)) %>% 
+    ungroup()
+
+classif_items <- sale_cur_month %>% 
+    left_join(select(ref_items, item_id, group_id),
+              by = "item_id") %>% 
+    filter(!group_id %in% c("000002195",  # Папір офісний А4 класс С
+                           "000002341",  # Папір офісний А4 класс A
+                           "000002340"),  # Папір офісний А4 класс B
+           !store %in% c("000001064", "000001098") # Накопители
+           ) %>% 
+    group_by(store) %>% 
+    arrange(desc(item_total_sum)) %>% 
+    mutate(sum_pct = item_total_sum / sum(item_total_sum),
+           cumulative_sum_pct = cumsum(sum_pct)) %>% 
+    filter(cumulative_sum_pct <= max(cumulative_sum_pct[
+        cumulative_sum_pct < 0.7]) &
+            item_purch_qty >= 5) %>%
+    ungroup() %>% 
+    select(store, item_id) %>% 
+    group_by(store) %>%
+    summarise(items_vec = as.vector(list(item_id))) %>% 
+    ungroup()
+
+groupA_data <- classif_items %>% 
+    mutate(data = pmap(list(rep(date_start + years(2000), times = nrow(classif_items)),
+                            store,
+                            items_vec),
+                       inventory_items_store_data),
+           available_lev_data = map_df(data, available_level_fn)) %>% 
+    select(store, available_lev_data) %>% 
+    unnest(cols = available_lev_data)
+
+total_available_level <- 1- round(sum(groupA_data$zero_days_items) /
+                                   sum(groupA_data$total_days_items),
+                               3)
+
+fig_available_level <- groupA_data %>%
+    slice_min(av_lev, n = 3) %>% 
+    left_join(select(ref_store, store_id, store_name),
+              by = c("store" = "store_id")) %>% 
+    ggplot(aes(x = reorder(store_name, av_lev, decreasing = TRUE),
+               y = av_lev)) +
+    geom_bar(stat = "identity", fill = "lightblue") +
+    geom_text(
+        aes(label = scales::percent(av_lev)),
+        size = 10,
+        hjust = 1, position = position_dodge(.9)
+    ) +
+    coord_flip() +
+    theme_minimal() +
+    labs(x = "", y = "") +
+    theme(axis.text.y = element_text(size = 22),
+          axis.text.x = element_blank(),
+          panel.grid.major.y = element_blank(),
+          panel.grid.major.x = element_blank())
+
+
+route_sheet_df <- route_sheet_raw %>% 
+    group_by(nmbr_deliv_order, date_deliv_order) %>% 
+    summarise(date_last_delivery = max(date_delivery),
+              scaned_qty = sum(is_scaned[date_delivery == date_last_delivery]),
+              not_scaned_qty = sum(!is_scaned[date_delivery == date_last_delivery]),
+              scan_time = max(scan_time[date_delivery == date_last_delivery],
+                              na.rm = TRUE),
+              reject_reason = str_c(unique(reject_reason[date_delivery == date_last_delivery]),
+                                    collapse = "")) %>% 
+    ungroup()
+
+
+customer_orders_in_route_sheet <- route_sheet_df %>% 
+    left_join(select(delivery_order_raw, nmbr_deliv_order, date_deliv_order,
+                     deliv_order_date_delivery = date_delivery,
+                     nmbr_sale_doc, date_sale_doc),
+              by = c("nmbr_deliv_order", "date_deliv_order")) %>% 
+    filter(!is.na(nmbr_sale_doc)) %>% 
+    left_join(select(sale_with_orders, nmbr_sale_doc, date_sale_doc, doc_sum, 
+                     cust_order_sum, nmbr_cust_order_doc, date_cust_order_doc,
+                     cust_order_date_delivery, subdiv_name),
+              by = c("nmbr_sale_doc", "date_sale_doc")) %>% 
+    filter(!is.na(nmbr_cust_order_doc)) %>% 
+    left_join(product_assembly_raw,
+              by = c("nmbr_deliv_order", "date_deliv_order"))
+
+total_order_with_assembly <- sum(!is.na(customer_orders_in_route_sheet$nmbr_assembly))
+
+on_time_assemblies <- customer_orders_in_route_sheet %>% 
+    filter(!is.na(nmbr_assembly)) %>% 
+    mutate(on_time_indicator = ifelse(as.numeric(deliv_order_date_delivery -
+                                                     time_finish) > 1,
+                                      1,
+                                      0)) %>% 
+    summarise(sum(on_time_indicator)) %>% 
+    pull()
+
+on_time_assemblies <- round(on_time_assemblies / total_order_with_assembly, 3)
+
+no_complaints_assemblies <- customer_orders_in_route_sheet %>% 
+    filter(!is.na(nmbr_assembly)) %>% 
+    mutate(complaints_indicator = ifelse(str_detect(reject_reason,
+                                                   "Товар відсутній в коробці"),
+                                         0,
+                                         1)) %>% 
+    summarise(sum(complaints_indicator)) %>% 
+    pull()
+
+no_complaints_assemblies <- round(no_complaints_assemblies /
+                                      total_order_with_assembly, 3)
+
+perfect_assembly_customer_orders <- round(on_time_assemblies *
+                                              no_complaints_assemblies,
+                                          3)
+
+on_time_delivery_customer_orders <- customer_orders_in_route_sheet %>% 
+    filter(as.Date(cust_order_date_delivery) > as.Date("4000-01-01")) %>% 
+    group_by(nmbr_cust_order_doc, date_cust_order_doc) %>% 
+    arrange(scan_time) %>% 
+    filter(row_number() == n()) %>%
+    ungroup() %>% 
+    mutate(on_time_indicator = ifelse(as.Date(scan_time) <= 
+                                          as.Date(cust_order_date_delivery),
+                                      1,
+                                      0)) %>% 
+    summarise(sum(on_time_indicator)) %>% 
+    pull()
+
+total_unique_customer_orders_1 <- customer_orders_in_route_sheet %>% 
+    filter(as.Date(cust_order_date_delivery) > as.Date("4000-01-01")) %>% 
+    distinct(nmbr_cust_order_doc, date_cust_order_doc) %>% 
+    nrow(.)
+
+on_time_delivery_customer_orders <- round(on_time_delivery_customer_orders /
+    total_unique_customer_orders_1, 3)
+
+median_customer_lead_time <- customer_orders_in_route_sheet %>% 
+    filter(scaned_qty > 0) %>% 
+    group_by(nmbr_cust_order_doc, date_cust_order_doc) %>% 
+    arrange(scan_time) %>% 
+    filter(row_number() == n()) %>%
+    ungroup() %>% 
+    mutate(lead_time = as.integer(difftime(scan_time, date_cust_order_doc, 
+                                           units = "hours"))) %>% 
+    filter(lead_time > 0) %>% 
+    summarise(median(lead_time)) %>% 
+    pull()
+
+no_complaints_customer_orders_delivery <- customer_orders_in_route_sheet %>% 
+    filter(scaned_qty > 0) %>%
+    group_by(nmbr_cust_order_doc, date_cust_order_doc) %>% 
+    arrange(scan_time) %>% 
+    filter(row_number() == n()) %>%
+    ungroup() %>% 
+    mutate(complaints_indicator = ifelse(str_detect(reject_reason,
+                              "Коробка або товар пошкоджений|Коробка відсутня"),
+                                         0,
+                                         1)) %>% 
+    summarise(sum(complaints_indicator)) %>% 
+    pull()
+
+total_unique_customer_orders_2 <- customer_orders_in_route_sheet %>% 
+    filter(scaned_qty > 0) %>% 
+    distinct(nmbr_cust_order_doc, date_cust_order_doc) %>% 
+    nrow(.)
+
+no_complaints_customer_orders_delivery <- round(
+    no_complaints_customer_orders_delivery / 
+        total_unique_customer_orders_2,
+    3)
+
+orders_in_closing_customer_order <- closing_customer_order_raw %>% 
+    distinct(nmbr_customer_order, date_customer_order)
+
+not_in_full_cust_orders <- intersect(orders_in_closing_customer_order,
+                                     select(customer_orders_in_route_sheet,
+                                     nmbr_customer_order = nmbr_cust_order_doc,
+                                     date_customer_order = date_cust_order_doc))
+    
+in_full_customer_orders <- round(1 - nrow(not_in_full_cust_orders) / 
+    total_unique_customer_orders_2,
+    3)
+
+perfect_customer_delivery <- round(on_time_delivery_customer_orders *
+                                       no_complaints_customer_orders_delivery *
+                                       in_full_customer_orders,
+                                   3)
+
+perfect_customer_order <- round(perfect_assembly_customer_orders *
+                                    perfect_customer_delivery,
+                                3)
+
+
+assembles_moving_out_data <- moving_out_in_delivery %>% 
+    filter(!is.na(nmbr_assembly)) %>%
+    mutate(on_time_assembles_indicator = ifelse(as.Date(time_finish) <= 
+                                                    as.Date(date_delivery),
+                                                1,
+                                                0),
+           on_time_delivery_indicator = ifelse(as.Date(act_date_delivery) <= 
+                                                    as.Date(date_delivery),
+                                                1,
+                                                0)) %>%
+    #filter(on_time_indicator == 0)
+    summarise(on_time_assembles_moving_out = sum(on_time_assembles_indicator),
+              assembles_complaints_qty = sum(!is.na(date_reclamation)),
+              total_moving_out_with_assembly = n(),
+              on_time_delivery_moving_out = sum(on_time_delivery_indicator))
+
+on_time_assemblies_moving_out <- round(assembles_moving_out_data$on_time_assembles_moving_out /
+                       assembles_moving_out_data$total_moving_out_with_assembly,
+                                      3)
+
+no_complaints_assemblies_moving_out <- round(1 -
+                                     assembles_moving_out_data$assembles_complaints_qty /
+                       assembles_moving_out_data$total_moving_out_with_assembly,
+                                            3)
+
+perfect_assembly_moving_out <- round(on_time_assemblies_moving_out *
+                                         no_complaints_assemblies_moving_out,
+                                     3)
+
+on_time_delivery_moving_out <- round(assembles_moving_out_data$on_time_delivery_moving_out /
+                       assembles_moving_out_data$total_moving_out_with_assembly,
+                                      3)
+
+perfect_moving_out <- round(perfect_assembly_moving_out *
+                                on_time_delivery_moving_out,
+                            3)
+
+
+df_receipt_by_doc <- df_receipt %>%
+    group_by(nmbr_receipt, store_name) %>% 
+    summarise(supplier_contract = first(supplier_contract),
+              subdiv_name = first(subdiv_name),
+              sku_qty = n(),
+              units_qty = sum(item_qty),
+              doc_sum = sum(item_sum)) %>%
+    ungroup()
+
+receipt_by_store <- df_receipt_by_doc %>% 
+    filter(store_name != "Транзит Поставщик-Клиент") %>% 
+    mutate(store_name = case_when(
+        store_name %in% c("Головний склад",
+                          "Луцьк Розподільчий склад")       ~ store_name,
+        str_detect(store_name, pattern = "(С|с)упермаркет") ~ "Супермаркети",
+        TRUE                                                ~ "Магазини")) %>%
+    group_by(store_name) %>% 
+    summarise(total_sku = sum(sku_qty),
+              total_units = sum(units_qty),
+              total_doc = n(),
+              total_sum = sum(doc_sum)) %>% 
+    ungroup()
+
+fig_receipt_by_store <- receipt_by_store %>% 
+    tidyr::pivot_longer(cols = total_sku:total_sum,
+                        names_to = "type",
+                        values_to = "count") %>%
+    group_by(type) %>% 
+    mutate(pct = count/sum(count)) %>% 
+    ggplot(aes(x = factor(type,
+                          labels = c("Документи", "SKU", "Сума", "Кількість")),
+               y = pct,
+               fill = factor(store_name,
+                             levels = c("Магазини",
+                                        "Супермаркети",
+                                        "Луцьк Розподільчий склад",
+                                        "Головний склад"),
+                             labels = c("Магазини",
+                                        "Супермаркети",
+                                        "Луцьк РЦ",
+                                        "ГC"))
+    )) + 
+    geom_bar(stat = "identity",
+             position = "fill") +
+    scale_y_continuous(breaks = seq(0, 1, .2), 
+                       label = scales::percent) +
+    geom_text(aes(label = scales::comma(round(count, 0))),
+              size = 3,
+              position = position_stack(vjust = 0.5)) +
+    scale_fill_brewer(palette = "Pastel1") +
+    labs(y = "Частка", 
+         fill = "",
+         x = "База для розрахунку",
+         title = "") +
+    theme_minimal() +
+    theme(legend.position = "top",
+          legend.text = element_text(size = 7),
+          legend.text.align = 0.5,
+          legend.spacing.x = unit(0.7, 'cm'))
+
+
+sale_by_organization <- sale_raw %>% 
+    filter(month == month(date_start)) %>% 
+    mutate(type_organization = case_when(
+        organiz_id == "000000001" ~ "КОРВЕТ ф1",
+        TRUE                      ~ "ПП"
+    )) %>% 
+    group_by(type_organization) %>% 
+    summarise(total_sum = sum(item_sum)) %>% 
+    mutate(analysis_base = "sale")
+
+receipt_by_organization <- df_receipt %>% 
+    mutate(type_organization = case_when(
+        organiz_name == "КОРВЕТ" & is_f2 == FALSE ~ "КОРВЕТ ф1",
+        organiz_name == "КОРВЕТ" & is_f2 == TRUE  ~ "КОРВЕТ ф2",
+        TRUE                                      ~ "ПП"
+    )) %>% 
+    group_by(type_organization) %>% 
+    summarise(total_sum = sum(item_sum)) %>% 
+    mutate(analysis_base = "purchase")
+
+fig_organization_analysis <- receipt_by_organization %>% 
+    bind_rows(sale_by_organization) %>% 
+    group_by(analysis_base) %>% 
+    mutate(pct = total_sum / sum(total_sum)) %>% 
+    ungroup() %>% 
+    ggplot(aes(x = factor(analysis_base,
+                      labels = c("Надходження", "Продаж")),
+           y = pct,
+           fill = factor(type_organization)
+)) + 
+    geom_bar(stat = "identity",
+             position = "fill") +
+    scale_y_continuous(breaks = seq(0, 1, .2), 
+                       label = scales::percent) +
+    geom_text(aes(label = scales::percent(pct)),
+              size = 3,
+              position = position_stack(vjust = 0.5)) +
+    scale_fill_brewer(palette = "Pastel1") +
+    labs(y = "Частка", 
+         fill = "",
+         x = "База для розрахунку",
+         title = "") +
+    theme_minimal() +
+    theme(legend.position = "top",
+          legend.text = element_text(size = 7),
+          legend.text.align = 0.5,
+          legend.spacing.x = unit(0.7, 'cm'))
+
+
+df_receipt_by_doc <- df_receipt %>%
+    group_by(nmbr_receipt, store_name) %>% 
+    summarise(supplier_contract = first(supplier_contract),
+              subdiv_name = first(subdiv_name),
+              sku_qty = n(),
+              units_qty = sum(item_qty),
+              doc_sum = sum(item_sum)) %>%
+    ungroup()
+
+fig_purchase_cond <- df_receipt_by_doc %>% 
+    left_join(select(ref_contract, contract_name, contract_arrears_day),
+              by = c("supplier_contract" = "contract_name")) %>% 
+    mutate(payment_term = case_when(
+        contract_arrears_day == 0             ~ "Передплата(по факту)",
+        between(contract_arrears_day, 1, 14)  ~ "1-14днів",
+        between(contract_arrears_day, 15, 30) ~ "15-30днів",
+        between(contract_arrears_day, 31, 60) ~ "31-60днів",
+        contract_arrears_day > 60             ~ "Більше 60днів"
+    )) %>% 
+    group_by(payment_term) %>% 
+    summarise(group_sum = sum(doc_sum)) %>% 
+    ggplot(aes(x = group_sum / 1000, y = factor(payment_term,
+                                                   levels = c(
+                                                       "Передплата(по факту)",
+                                                       "1-14днів",
+                                                       "15-30днів",
+                                                       "31-60днів",
+                                                       "Більше 60днів")))) +
+  
+    ggalt::geom_lollipop(
+        horizontal   = TRUE,
+        point.colour = "dodgerblue",
+        point.size   = 6,
+        color        = "#2c3e50",
+        size         = 1
+    ) +
+  
+    # geom_label(aes(label = str_glue("Сумма закупки: {round(group_sum)}")),
+    #            size    = 2,
+    #            hjust   = "outward",
+    #            vjust = 0
+    #            nudge_x = 30
+    #            ) +
+    # expand_limits(x = xmax + 200) +
+  
+    labs(title = "",
+         x = "Сума, тис.грн", y = "") +
+    theme_minimal() +
+    theme(
+        panel.grid.minor=element_blank(),
+        panel.grid.major.y=element_blank(),
+        panel.grid.major.x=element_line(),
+        axis.ticks=element_blank(),
+        panel.border=element_blank()
+    )
+```
+
+```{r transport_data}
+cargo_auto_id <- ref_auto %>% 
+    filter(is_cargo) %>% 
+    pull(auto_id)
+
+cargo_auto_subdiv_id <- ref_auto %>% 
+    filter(is_cargo) %>% 
+    pull(subdiv_id)
+
+delivery_df <- delivery_raw %>% 
+    filter(!direction %in% c("САМОВИВІЗ", "Закриття документів"),
+           !is.na(nmbr_deliv_order) | !is.na(nmbr_laggage),
+           speedo_finish > 0 & speedo_finish > speedo_start,
+           vehicle_id %in% cargo_auto_id,
+           !is_not_delivered) %>% 
+    left_join(select(delivery_order_raw, nmbr_deliv_order, date_deliv_order,
+                     deliv_address, deliv_order_store_id = store_id,
+                     deliv_order_store = store_name, intermediate_store,
+                     recipient_store,
+                     date_for_delivery = date_delivery, order_weight),
+              by = c("nmbr_deliv_order", "date_deliv_order")) %>%
+    left_join(select(laggage_raw, nmbr_laggage, date_laggage, laggage_weight),
+              by = c("nmbr_laggage", "date_laggage")) %>%
+    replace_na(list(order_weight = 0, laggage_weight = 0)) %>%
+    filter(store_name == deliv_order_store |
+               (store_name == intermediate_store & to_intermediate == FALSE) |
+               (store_id == "000000001" & deliv_order_store_id == "000000006" &
+                    is.na(recipient_store) & is.na(intermediate_store)))
+
+delivery_weight <- delivery_df %>% 
+    group_by(nmbr_delivery, date_delivery) %>%
+    summarise(delivery_weight = sum(order_weight) + sum(laggage_weight),
+              delivery_distance = first(speedo_finish) - first(speedo_start),
+              vehicle_id = first(vehicle_id))
+
+load_factor_data <- delivery_weight %>% 
+    # distinct(nmbr_delivery, date_delivery, vehicle_id, .keep_all = TRUE) %>% 
+    # mutate(delivery_distance = speedo_finish - speedo_start) %>% 
+    # select(nmbr_delivery, date_delivery, vehicle_id,
+    #        delivery_weight, delivery_distance) %>% 
+    # filter(delivery_weight > 0) %>% 
+    group_by(vehicle_id) %>% 
+    mutate(wt = delivery_distance / sum(delivery_distance)) %>% 
+    summarise(avr_weight = weighted.mean(delivery_weight, wt),
+              delivery_qty = n(),
+              total_distance = sum(delivery_distance)) %>% 
+    left_join(select(ref_auto, auto_id, auto_name, load_capacity, store_id),
+              by = c("vehicle_id" = "auto_id")) %>% 
+    left_join(select(ref_store, store_id, store_name),
+              by = "store_id") %>% 
+    mutate(load_factor = round(avr_weight / (load_capacity * 1000), 2))
+
+total_load_factor <- round(weighted.mean(load_factor_data$load_factor,
+                                   load_factor_data$total_distance,
+                                   na.rm = TRUE),
+                           3)
+
+fig_load_factor <- load_factor_data %>% 
+    slice_min(load_factor, n = 3) %>% 
+    ggplot(aes(x = reorder(auto_name, load_factor, decreasing = TRUE),
+               y = load_factor)) +
+    geom_bar(stat = "identity", fill = "lightblue") +
+    geom_text(
+        aes(label = scales::percent(load_factor)),
+        size = 6,
+        hjust = 1, position = position_dodge(.9)
+    ) +
+    coord_flip() +
+    theme_minimal() +
+    labs(x = "", y = "") +
+    theme(axis.text.y = element_text(size = 14),
+          axis.text.x = element_blank(),
+          panel.grid.major.y = element_blank(),
+          panel.grid.major.x = element_blank())
+
+
+delivery_with_sale_doc <- delivery_df %>% 
+    filter(!is.na(nmbr_deliv_order)) %>% 
+    left_join(select(delivery_order_raw, nmbr_deliv_order, date_deliv_order,
+                     nmbr_sale_doc, date_sale_doc),
+              by = c("nmbr_deliv_order", "date_deliv_order")) %>% 
+    left_join(select(sale_with_orders, nmbr_sale_doc, date_sale_doc, 
+                     subdiv_name, customer_id, doc_sum),
+              by = c("nmbr_sale_doc", "date_sale_doc"))
+    
+
+avr_delivery_sale_doc_amount <- delivery_with_sale_doc %>% 
+    filter(!is.na(nmbr_sale_doc)) %>% 
+    group_by(nmbr_delivery, date_delivery, subdiv_name, customer_id) %>% 
+    summarise(delivery_sum = sum(doc_sum)) %>% 
+    ungroup()
+
+avr_delivery_sale_doc_amount_subdiv <- avr_delivery_sale_doc_amount %>% 
+    group_by(subdiv_name) %>% 
+    summarise(total_delivery = n(),
+              median_sum = round(median(delivery_sum, na.rm = TRUE)))
+
+total_avr_deliv_sale_doc_amount <- avr_delivery_sale_doc_amount %>% 
+    summarise(round(median(delivery_sum, na.rm = TRUE))) %>% pull()
+
+fig_avr_delivery_sale_doc_sum <- avr_delivery_sale_doc_amount_subdiv %>% 
+    filter(total_delivery > 10) %>% 
+    slice_min(median_sum, n = 3) %>% 
+    ggplot(aes(x = reorder(subdiv_name, median_sum, decreasing = TRUE),
+               y = median_sum)) +
+    geom_bar(stat = "identity", fill = "lightblue") +
+    geom_text(
+        aes(label = scales::comma(median_sum)),
+        size = 6,
+        hjust = 1, position = position_dodge(.9)
+    ) +
+    coord_flip() +
+    theme_minimal() +
+    labs(x = "", y = "") +
+    theme(axis.text.y = element_text(size = 14),
+          axis.text.x = element_blank(),
+          panel.grid.major.y = element_blank(),
+          panel.grid.major.x = element_blank())
+
+drivers_in_trade_subdiv_salary_month <-  drivers_in_trade_subdiv_salary_data %>%
+    group_by(month) %>% 
+    summarise(exp_sum = sum(total_salary))
+
+
+logistic_department_head <- current_month_salary %>% 
+    filter(#position_id == "000000233",
+        individ_id == "000007726",
+        subdiv_name == "Відділ складської логістики") %>% 
+    pull(total_salary)
+
+lutsk_drivers <- current_month_salary %>%
+    filter(position_id %in% c("000000041", "000000039"),
+           subdiv_name %in% c("Логістика, Луцьк")) %>% 
+    summarise(sum(total_salary)) %>% 
+    pull()
+
+not_cargo_auto_driver <- delivery_raw %>% 
+    filter(!vehicle_id %in% cargo_auto_id,
+           speedo_finish > 0 & speedo_finish > speedo_start) %>% 
+    distinct(nmbr_delivery, date_delivery, .keep_all = TRUE) %>% 
+    mutate(distance = speedo_finish - speedo_start) %>% 
+    group_by(vehicle_id, driver) %>% 
+    summarise(delivery_qty = n(),
+              distance = sum(distance)) %>% 
+    ungroup() %>% 
+    filter(delivery_qty >= 10) %>% 
+    pull(driver)
+
+drivers_not_cargo <- current_month_salary %>% 
+    filter(position_id == "000000041",
+           individ_id %in% not_cargo_auto_driver) %>% 
+    summarise(sum(total_salary)) %>% 
+    pull()
+
+transport_expenses <- expenses_raw %>% 
+    filter(month == month(date_start),
+           subdiv_id %in% c("000000005", cargo_auto_subdiv_id)) %>% 
+    summarise(sum(exp_sum)) %>% 
+    pull()
+
+drivers_in_trade_subdiv_salary_current <- drivers_in_trade_subdiv_salary_month %>% 
+    filter(month == month(date_start)) %>% 
+    pull(exp_sum)
+
+total_delivery_distance <- sum(delivery_weight$delivery_distance)
+
+transport_expenses <- transport_expenses+drivers_in_trade_subdiv_salary_current+ 
+    lutsk_drivers + logistic_department_head / 2 - drivers_not_cargo
+    
+cost_1km <- round(transport_expenses / total_delivery_distance, 1)
+
+ontime_delivery <- round(1 - customer_orders_in_route_sheet %>% 
+    filter(as.Date(scan_time) > as.Date(deliv_order_date_delivery)) %>% 
+    nrow(.) / total_unique_customer_orders_2, 3)
+
+perfect_cust_delivery <- round(ontime_delivery *
+    no_complaints_customer_orders_delivery,
+    3)
+
+
+unique_deliveries <- delivery_raw %>% 
+    distinct(nmbr_delivery, date_delivery, driver, forwarder, vehicle_id,
+             route_id, time_depart, time_return, speedo_start, speedo_finish) %>% 
+    mutate(crew_hours = make_difftime(time_return - time_depart, units = "hour"),
+           distance = speedo_finish - speedo_start) %>% 
+    filter(crew_hours > 0,
+           crew_hours < 24)
+
+driver_data <- unique_deliveries %>% 
+    group_by(driver) %>% 
+    summarise(deliv_qty = n(),
+              effective_time = as.numeric(sum(crew_hours))) %>% 
+    left_join(select(work_time_df, individ_id, working_hours, position_id),
+              by = c("driver" = "individ_id")) %>% 
+    filter(position_id == "000000041") %>% 
+    mutate(workload = round(effective_time / working_hours, 3)) %>% 
+    rename(employee = driver)
+
+forwarder_data <- unique_deliveries %>% 
+    group_by(forwarder) %>% 
+    summarise(deliv_qty = n(),
+              effective_time = as.numeric(sum(crew_hours))) %>% 
+    left_join(select(work_time_df, individ_id, working_hours, position_id),
+              by = c("forwarder" = "individ_id")) %>% 
+    filter(position_id == "000000039") %>% 
+    mutate(workload = round(effective_time / working_hours, 3)) %>% 
+    rename(employee = forwarder)
+
+delivery_crew_workload <- bind_rows(driver_data, forwarder_data) %>% 
+    left_join(ref_individuals, by = c("employee" = "user_id"))
+
+avr_deliv_workload <- round(sum(delivery_crew_workload$effective_time) /
+                                sum(delivery_crew_workload$working_hours),
+                            3)
+
+fig_deliv_workload <- delivery_crew_workload %>% 
+    slice_min(workload, n = 3) %>% 
+    ggplot(aes(x = reorder(user_name, workload, decreasing = TRUE),
+               y = workload)) +
+    geom_bar(stat = "identity", fill = "lightblue") +
+    geom_text(
+        aes(label = scales::percent(workload)),
+        size = 6,
+        hjust = 1, position = position_dodge(.9)
+    ) +
+    coord_flip() +
+    theme_minimal() +
+    labs(x = "", y = "") +
+    theme(axis.text.y = element_text(size = 14),
+          axis.text.x = element_blank(),
+          panel.grid.major.y = element_blank(),
+          panel.grid.major.x = element_blank())
+
+
+store_for_delivery <- ref_store %>% 
+    filter(parent_store == "Товар",
+           store_location != "")
+
+distribution_stores <- unique(na.omit(ref_store$distribution_store))
+
+cleared_deliveries <- delivery_with_sale_doc %>%
+    filter(to_intermediate == FALSE) %>% 
+    select(nmbr_delivery:speedo_finish, nmbr_deliv_order, date_deliv_order,
+           deliv_order_store_id, deliv_order_store, intermediate_store,
+           deliv_address, nmbr_sale_doc:doc_sum) %>% 
+    left_join(select(delivery_order_raw, nmbr_deliv_order, date_deliv_order,
+                     nmbr_moving_out, date_moving_out, recipient_store),
+              by = c("nmbr_deliv_order", "date_deliv_order")) %>% 
+    left_join(select(ref_store, store_id,
+                     distrib_store_sender = distribution_store),
+              by = c("deliv_order_store_id" = "store_id")) %>% 
+    left_join(select(ref_store, store_id,
+                     distrib_store_recipient = distribution_store),
+              by = c("recipient_store" = "store_id")) %>% 
+    filter(is.na(recipient_store) | 
+               recipient_store %in% store_for_delivery$store_id,
+           is.na(recipient_store) | store_id != recipient_store,
+           !(!is.na(nmbr_moving_out) & !deliv_order_store_id %in% distribution_stores &
+               !recipient_store %in% distribution_stores &
+               distrib_store_sender != distrib_store_recipient),
+           !(!is.na(nmbr_moving_out) &
+                 recipient_store %in% c("000001110") & store_id != "000000022" &
+                 (deliv_order_store_id %in% c("000000001") |
+                      (!is.na(intermediate_store) & intermediate_store ==
+                           "Головний склад"))),
+           !(route_id == "000000106" & !is.na(nmbr_moving_out))
+           )
+
+deliveries_summary <- cleared_deliveries %>% 
+    group_by(nmbr_delivery, date_delivery, store_id,) %>% 
+    summarise(driver = first(driver),
+              forwarder = first(forwarder),
+              direction = first(direction),
+              route_id = first(route_id),
+              store_id = first(store_id),
+              vehicle_name = first(vehicle_name),
+              distance = first(speedo_finish) - first(speedo_start),
+              customers_qty = n_distinct(customer_id, deliv_address, na.rm = TRUE),
+              customer_sum = sum(doc_sum, na.rm = TRUE),
+              store_qty = n_distinct(recipient_store, na.rm = TRUE),
+              store_list = ifelse(store_qty == 0,
+                                  "",
+                                  toString(unique(na.omit(recipient_store))))
+    ) %>% 
+    ungroup()
+
+
+distinct_moving_out <- deliveries_summary %>% 
+    left_join(select(ref_route, route_id, route_parent),
+              by = "route_id") %>% 
+    filter(route_parent != "Районы" |
+               (route_parent == "Районы" & route_id == "000000110")) %>% 
+    distinct(store_id, store_list, direction) %>% 
+    filter(store_list != "") %>% 
+    splitstackshape::cSplit(splitCols = "store_list", ", ", type.convert = FALSE,
+                            drop = FALSE) %>% 
+    mutate(id = row_number())
+
+distance_moving_out_data <- distinct_moving_out %>% 
+    select(id, direction, store_id, starts_with("store_list_")) %>% 
+    pivot_longer(cols = contains("store"), names_to = "store") %>%
+    filter(!is.na(value)) %>% 
+    left_join(select(ref_store, store_id, store_address = store_location),
+              by = c("value" = "store_id")) %>% 
+    filter(!(direction == "Хмельницкий" & !str_detect(store_address,
+                                                   "Хмельницький")))
+
+sender_store <- distance_moving_out_data %>% 
+    group_by(id) %>% 
+    filter(store == "store_id") %>% 
+    ungroup() %>% 
+    select(id, store_address)
+
+
+library(tidygeocoder)
+library(sf)
+library(osrm)
+
+store_geocode <- unique(distance_moving_out_data$store_address) %>% 
+    str_replace("м.", "") %>% 
+    geo(method = "osm")
+
+distance_fn <- function(data) {
+    route <- data %>% 
+        left_join(store_geocode, by = c("store_address" = "address")) %>% 
+        st_as_sf(coords = c("long", "lat"), crs = 4326) %>% 
+        osrmTrip(returnclass = "sf")
+    
+    distance <- route[[1]]$summary$distance
+}
+
+distance_moving_out <- distance_moving_out_data %>% 
+    select(id, store_address) %>% 
+    add_row(sender_store) %>% 
+    mutate(store_address = str_replace(store_address, "м.", ""),
+           store_address = str_trim(store_address, side = "left")) %>% 
+    group_by(id) %>% 
+    nest() %>% 
+    transmute(moving_out_distance = map_dbl(data, distance_fn)) %>% 
+    ungroup() %>% 
+    left_join(select(distinct_moving_out, id, store_id, direction, store_list),
+              by = "id") %>% 
+    select(-id)
+   
+deliveries_by_auto_data <- deliveries_summary %>% 
+    left_join(select(ref_route, route_id, route_parent),
+              by = "route_id") %>% 
+    filter(route_parent != "Районы" |
+               (route_parent == "Районы" & route_id == "000000110")) %>% 
+    left_join(distance_moving_out, by = c("store_id", "direction",
+                                          "store_list")) %>% 
+    replace_na(list(moving_out_distance = 0))
+
+drivers_by_auto <- deliveries_by_auto_data %>% 
+    group_by(vehicle_name, driver) %>% 
+    summarise(driver_deliv = n()) %>%
+    group_by(vehicle_name) %>% 
+    filter(driver_deliv == max(driver_deliv)) %>% 
+    ungroup() %>% 
+    select(-driver_deliv)
+
+forwarders_by_auto <- deliveries_by_auto_data %>% 
+    group_by(vehicle_name, forwarder) %>% 
+    summarise(forwarder_deliv = n()) %>% 
+    group_by(vehicle_name) %>% 
+    filter(forwarder_deliv == max(forwarder_deliv)) %>% 
+    ungroup() %>% 
+    select(-forwarder_deliv)
+
+auto_total_distance <- delivery_raw %>% 
+    distinct(nmbr_delivery, date_delivery, .keep_all = TRUE) %>% 
+    mutate(distance = ifelse(speedo_finish > 0 & speedo_finish > speedo_start,
+                             speedo_finish - speedo_start,
+                             0)) %>% 
+    group_by(vehicle_name) %>% 
+    summarise(auto_total_distance = sum(distance))
+
+auto_month_cost <- expenses_raw %>% 
+    filter(month == month(date_start),
+           subdiv_id %in% cargo_auto_subdiv_id) %>% 
+    group_by(subdiv_id) %>% 
+    summarise(total_exp = sum(exp_sum)) %>% 
+    left_join(select(ref_auto, subdiv_id, auto_name),
+              by = "subdiv_id") %>% 
+    select(-subdiv_id)
+
+deliveries_by_auto <- deliveries_by_auto_data %>% 
+    group_by(vehicle_name) %>% 
+    summarise(total_distance = sum(distance),
+              total_moving_distance = sum(moving_out_distance),
+              total_cust_deliveries = sum(customers_qty),
+              total_cust_sum = sum(customer_sum)) %>% 
+    mutate(moving_share = round(total_moving_distance / total_distance, 3)) %>% 
+    left_join(auto_total_distance, by = "vehicle_name") %>% 
+    filter(total_distance / auto_total_distance > 0.75) %>% 
+    left_join(drivers_by_auto, by = "vehicle_name") %>% 
+    left_join(select(current_month_salary, individ_id,
+                     driver_position = position_id,
+                     driver_salary = total_salary),
+              by = c("driver" = "individ_id")) %>% 
+    mutate(driver_salary = ifelse(driver_position == "000000041",
+                                  driver_salary,
+                                  0)) %>% 
+    left_join(forwarders_by_auto, by = "vehicle_name") %>% 
+    left_join(select(current_month_salary, individ_id,
+                     forwarder_position = position_id,
+                     forwarder_salary = total_salary),
+              by = c("driver" = "individ_id")) %>% 
+    mutate(forwarder_salary = ifelse(forwarder != driver &
+                                         !forwarder %in% .$driver &
+                                         forwarder_position %in% c("000000041",
+                                                                  "000000039"),
+                                     forwarder_salary,
+                                     0)) %>% 
+    select(-c(driver:driver_position,
+              forwarder:forwarder_position)) %>% 
+    left_join(auto_month_cost, by = c("vehicle_name" = "auto_name")) %>% 
+    mutate(cost_delivery = round((driver_salary + forwarder_salary + total_exp)*
+               (1 - moving_share) / total_cust_deliveries),
+           cost_1km = round((driver_salary + forwarder_salary + total_exp)*
+               (1 - moving_share) / auto_total_distance, 1))
+
+avr_delivery_cost <- round((sum(deliveries_by_auto$driver_salary) +
+                              sum(deliveries_by_auto$forwarder_salary) +
+                              sum(deliveries_by_auto$total_exp)) *
+                             (1 - sum(deliveries_by_auto$total_moving_distance) /
+                                  sum(deliveries_by_auto$total_distance)) / 
+                             sum(deliveries_by_auto$total_cust_deliveries))
+
+fig_deliv_cost <- deliveries_by_auto %>% 
+    slice_max(cost_delivery, n = 3) %>% 
+    ggplot(aes(x = reorder(vehicle_name, cost_delivery, decreasing = TRUE),
+               y = cost_delivery)) +
+    geom_bar(stat = "identity", fill = "lightblue") +
+    geom_text(
+        aes(label = cost_delivery),
+        size = 6,
+        hjust = 1, position = position_dodge(.9)
+    ) +
+    coord_flip() +
+    theme_minimal() +
+    labs(x = "", y = "") +
+    theme(axis.text.y = element_text(size = 14),
+          axis.text.x = element_blank(),
+          panel.grid.major.y = element_blank(),
+          panel.grid.major.x = element_blank())
+
+fig_1km_cost<- deliveries_by_auto %>% 
+    slice_max(cost_1km, n = 3) %>% 
+    ggplot(aes(x = reorder(vehicle_name, cost_1km, decreasing = TRUE),
+               y = cost_1km)) +
+    geom_bar(stat = "identity", fill = "lightblue") +
+    geom_text(
+        aes(label = cost_1km),
+        size = 6,
+        hjust = 1, position = position_dodge(.9)
+    ) +
+    coord_flip() +
+    theme_minimal() +
+    labs(x = "", y = "") +
+    theme(axis.text.y = element_text(size = 14),
+          axis.text.x = element_blank(),
+          panel.grid.major.y = element_blank(),
+          panel.grid.major.x = element_blank())
+```
+
+
+```{r warehouse}
+
+suppl_inspection <- df_inspection %>% 
+    filter(!is.na(nmbr_receipt)) %>% 
+    group_by(nmbr_inspection, date_inspection) %>% 
+    summarise(store = first(store_receipt),
+              supplier = first(supplier_id),
+              inspector = first(user_id),
+              inspection_duration = last(time_finish) - first(time_start),
+              lines = n(),
+              total_units = sum(item_qty),
+              deviation_lines = sum(deviation_qty != 0))
+
+avr_suppl_inspection_time = round(median(as.numeric(
+    suppl_inspection$inspection_duration))/60, 1)
+
+suppl_inspection_by_store <- suppl_inspection %>% 
+    group_by(store) %>% 
+    summarise(avr_inspection_duration = 
+                  round(median(as.numeric(inspection_duration)) / 60, 1),
+              inspection_qty = n())
+
+distribution_stores_name_subdiv <- tibble(store_id = distribution_stores) %>% 
+    left_join(select(ref_store, store_id, store_name, subdiv_name),
+              by = "store_id")
+
+distribution_stores_name <- distribution_stores_name_subdiv %>% 
+    pull(store_name)
+
+distribution_stores_subdiv <- distribution_stores_name_subdiv %>% 
+    pull(subdiv_name)
+
+fig_suppl_inspection_by_store <- suppl_inspection_by_store %>% 
+    filter(store %in% distribution_stores_name) %>% 
+    ggplot(aes(x = store,
+               y = avr_inspection_duration)) +
+    geom_bar(stat = "identity", fill = "lightblue") +
+    geom_text(
+        aes(label = paste0(avr_inspection_duration, "(", inspection_qty, ")")),
+        size = 7,
+        hjust = 1, position = position_dodge(.9)
+    ) +
+    coord_flip() +
+    theme_minimal() +
+    labs(x = "", y = "") +
+    theme(axis.text.y = element_text(size = 16),
+          axis.text.x = element_blank(),
+          panel.grid  = element_blank())
+
+suppl_inspection_by_supplier <- suppl_inspection %>% 
+    left_join(select(ref_suppliers, supplier_id, main_cust_id),
+              by = c("supplier" = "supplier_id")) %>% 
+    mutate(supplier = ifelse(!is.na(main_cust_id),
+                             main_cust_id,
+                             supplier)) %>% 
+    group_by(supplier) %>% 
+    summarise(avr_inspection_duration = 
+                  round(median(as.numeric(inspection_duration)) / 60, 1),
+              inspection_qty = n(),
+              deviation_share = round(sum(deviation_lines) / sum(lines), 3),
+              total_lines = sum(lines)) %>% 
+    arrange(desc(avr_inspection_duration)) %>% 
+    left_join(select(ref_suppliers, supplier_id, supplier_name),
+              by = c("supplier" = "supplier_id"))
+
+fig_suppl_inspection_by_supplier <- suppl_inspection_by_supplier %>% 
+    slice_max(avr_inspection_duration, n = 3) %>% 
+    ggplot(aes(x = reorder(supplier_name, avr_inspection_duration,
+                           decreasing = TRUE),
+               y = avr_inspection_duration)) +
+    geom_bar(stat = "identity", fill = "lightblue") +
+    geom_text(
+        aes(label = round(avr_inspection_duration)),
+        size = 6,
+        hjust = 0.9, position = position_dodge(.9)
+    ) +
+    coord_flip() +
+    theme_minimal() +
+    labs(x = "", y = "") +
+    theme(axis.text.y = element_text(size = 16),
+          axis.text.x = element_blank(),
+          panel.grid  = element_blank())
+
+fig_suppl_inspection_deviation <- suppl_inspection_by_supplier %>% 
+    slice_max(deviation_share, n = 3) %>% 
+    ggplot(aes(x = reorder(supplier_name, deviation_share),
+               y = deviation_share)) +
+    geom_bar(stat = "identity", fill = "lightblue") +
+    geom_text(
+        aes(label = paste0(scales::percent(deviation_share),
+                           "(", total_lines, ")")),
+        size = 6,
+        hjust = 1, position = position_dodge(.9)
+    ) +
+    coord_flip() +
+    theme_minimal() +
+    labs(x = "", y = "") +
+    theme(axis.text.y = element_text(size = 16),
+          axis.text.x = element_blank(),
+          panel.grid  = element_blank())
+
+suppl_inspection_by_inspector <- suppl_inspection %>% 
+    group_by(inspector) %>% 
+    summarise(avr_inspection_duration = 
+                  round(median(as.numeric(inspection_duration)) / 60, 1),
+              inspection_qty = n()) %>% 
+    arrange(desc(avr_inspection_duration)) %>% 
+    left_join(select(ref_individuals, user_id, user_name),
+              by = c("inspector" = "user_id"))
+
+
+moving_inspection <- df_inspection %>% 
+    filter(!is.na(nmbr_moving_out)) %>% 
+    group_by(nmbr_inspection, date_inspection) %>% 
+    summarise(store = first(store_recipient),
+              supplier = first(store_sender),
+              inspector = first(user_id),
+              inspection_duration = ifelse(
+                  as.Date(time_start) >= as.Date("4022-01-01"),
+                  last(time_finish) - first(time_start),
+                  0),
+              lines = n(),
+              total_units = sum(item_qty),
+              deviation_lines = sum(deviation_qty != 0))
+
+avr_moving_inspection_time = round(median(as.numeric(
+    moving_inspection$inspection_duration[moving_inspection$inspection_duration > 0]))/60, 1)
+
+moving_inspection_by_store <- moving_inspection %>% 
+    group_by(store) %>% 
+    summarise(avr_inspection_duration = 
+                  round(median(as.numeric(inspection_duration)) / 60, 1),
+              inspection_qty = n())
+
+fig_moving_inspection_by_store <- moving_inspection_by_store %>% 
+    filter(store %in% distribution_stores_name) %>% 
+    ggplot(aes(x = store,
+               y = avr_inspection_duration)) +
+    geom_bar(stat = "identity", fill = "lightblue") +
+    geom_text(
+        aes(label = paste0(avr_inspection_duration, "(", inspection_qty, ")")),
+        size = 6,
+        hjust = 1, position = position_dodge(.9)
+    ) +
+    coord_flip() +
+    theme_minimal() +
+    labs(x = "", y = "") +
+    theme(axis.text.y = element_text(size = 16),
+          axis.text.x = element_blank(),
+          panel.grid  = element_blank())
+
+moving_inspection_by_sender <- moving_inspection %>% 
+    group_by(supplier) %>% 
+    summarise(avr_inspection_duration = 
+                  round(median(as.numeric(inspection_duration)) / 60, 1),
+              inspection_qty = n(),
+              deviation_share = round(sum(deviation_lines) / sum(lines), 3),
+              total_lines = sum(lines)) %>% 
+    arrange(desc(avr_inspection_duration))
+
+fig_moving_inspection_by_sender <- moving_inspection_by_sender %>% 
+    slice_max(avr_inspection_duration, n = 3) %>% 
+    ggplot(aes(x = reorder(supplier, avr_inspection_duration,
+                           decreasing = TRUE),
+               y = avr_inspection_duration)) +
+    geom_bar(stat = "identity", fill = "lightblue") +
+    geom_text(
+        aes(label = paste0(avr_inspection_duration, "(", inspection_qty, ")")),
+        size = 6,
+        hjust = 1, position = position_dodge(.9)
+    ) +
+    coord_flip() +
+    theme_minimal() +
+    labs(x = "", y = "") +
+    theme(axis.text.y = element_text(size = 16),
+          axis.text.x = element_blank(),
+          panel.grid  = element_blank())
+
+fig_moving_inspection_deviation <- moving_inspection_by_sender %>% 
+    slice_max(deviation_share, n = 3) %>% 
+    ggplot(aes(x = reorder(supplier, deviation_share),
+               y = deviation_share)) +
+    geom_bar(stat = "identity", fill = "lightblue") +
+    geom_text(
+        aes(label = paste0(scales::percent(deviation_share),
+                           "(", total_lines, ")")),
+        size = 6,
+        hjust = 1, position = position_dodge(.9)
+    ) +
+    coord_flip() +
+    theme_minimal() +
+    labs(x = "", y = "") +
+    theme(axis.text.y = element_text(size = 16),
+          axis.text.x = element_blank(),
+          panel.grid  = element_blank())
+
+moving_inspection_by_inspector <- moving_inspection %>% 
+    group_by(inspector) %>% 
+    summarise(avr_inspection_duration = 
+                  round(median(as.numeric(inspection_duration)) / 60, 1),
+              inspection_qty = n()) %>% 
+    arrange(desc(avr_inspection_duration)) %>% 
+    left_join(select(ref_individuals, user_id, user_name),
+              by = c("inspector" = "user_id"))
+
+
+assembly_current_month <- product_assembly_raw %>% 
+    filter(date_assembly >= date_start + years(2000)) %>% 
+    left_join(select(delivery_order_raw, nmbr_deliv_order, date_deliv_order,
+                     store_id, nmbr_sale_doc, date_sale_doc,
+                     nmbr_moving_out, date_moving_out),
+              by = c("nmbr_deliv_order", "date_deliv_order")) %>% 
+    mutate(assembly_duration = time_finish - time_start)
+
+customer_assembly <- assembly_current_month %>% 
+    filter(!is.na(nmbr_sale_doc))
+
+avr_customer_assembly_time = round(median(
+    as.numeric(customer_assembly$assembly_duration))/60, 1)
+
+customer_assembly_by_store <- customer_assembly %>% 
+    group_by(store_id) %>% 
+    summarise(avr_assembly_duration = 
+                  round(median(as.numeric(assembly_duration)) / 60, 1),
+              assembly_qty = n()) %>% 
+    left_join(select(ref_store, store_id, store_name),
+              by = "store_id")
+
+fig_customer_assembly_by_store <- customer_assembly_by_store %>% 
+    filter(store_name %in% distribution_stores_name) %>% 
+    ggplot(aes(x = reorder(store_name, avr_assembly_duration),
+               y = avr_assembly_duration)) +
+    geom_bar(stat = "identity", fill = "lightblue") +
+    geom_text(
+        aes(label = paste0(avr_assembly_duration, "(", assembly_qty, ")")),
+        size = 7,
+        hjust = 1, position = position_dodge(.9)
+    ) +
+    coord_flip() +
+    theme_minimal() +
+    labs(x = "", y = "") +
+    theme(axis.text.y = element_text(size = 16),
+          axis.text.x = element_blank(),
+          panel.grid  = element_blank())
+
+customer_assembly_by_picker <- customer_assembly %>% 
+    group_by(picker) %>% 
+    summarise(avr_assembly_duration = 
+                  round(median(as.numeric(assembly_duration)) / 60, 1),
+              assembly_qty = n()) %>% 
+    left_join(select(ref_individuals, user_id, user_name),
+              by = c("picker" = "user_id")) %>% 
+    arrange(desc(avr_assembly_duration))
+
+moving_assembly <- assembly_current_month %>% 
+    filter(!is.na(nmbr_moving_out))
+
+avr_moving_assembly_time = round(median(
+    as.numeric(moving_assembly$assembly_duration))/60, 1)
+
+moving_assembly_by_store <- moving_assembly %>% 
+    group_by(store_id) %>% 
+    summarise(avr_assembly_duration = 
+                  round(median(as.numeric(assembly_duration)) / 60, 1),
+              assembly_qty = n()) %>% 
+    left_join(select(ref_store, store_id, store_name),
+              by = "store_id")
+
+fig_moving_assembly_by_store <- moving_assembly_by_store %>% 
+    filter(store_name %in% distribution_stores_name) %>% 
+    ggplot(aes(x = reorder(store_name, avr_assembly_duration),
+               y = avr_assembly_duration)) +
+    geom_bar(stat = "identity", fill = "lightblue") +
+    geom_text(
+        aes(label = paste0(avr_assembly_duration, "(", assembly_qty, ")")),
+        size = 7,
+        hjust = 1, position = position_dodge(.9)
+    ) +
+    coord_flip() +
+    theme_minimal() +
+    labs(x = "", y = "") +
+    theme(axis.text.y = element_text(size = 16),
+          axis.text.x = element_blank(),
+          panel.grid  = element_blank())
+
+moving_assembly_by_picker <- moving_assembly %>% 
+    group_by(picker) %>% 
+    summarise(avr_assembly_duration = 
+                  round(median(as.numeric(assembly_duration)) / 60, 1),
+              assembly_qty = n()) %>% 
+    left_join(select(ref_individuals, user_id, user_name),
+              by = c("picker" = "user_id")) %>% 
+    arrange(desc(avr_assembly_duration))
+
+
+supplier_inspection_user_data <- df_inspection %>%
+    filter(!is.na(nmbr_receipt), 
+           as.Date(time_start) > as.Date("4022-01-01")) %>% 
+    group_by(nmbr_inspection, date_inspection) %>% 
+    summarise(user_id = first(user_id),
+              time_start = first(time_start),
+              time_finish = last(time_finish),
+              items_qty = sum(item_qty > 0),
+              units_qty = sum(item_qty)) %>% 
+    ungroup() %>% 
+    # pivot_longer(cols = time_start:time_finish,
+    #              names_to = "flag_time",
+    #              values_to = "time_operation") %>% 
+    mutate(type_operation = "supplier_inspection", .after = user_id) %>% 
+    rename(doc_nmbr = nmbr_inspection,
+           doc_date = date_inspection)
+
+moving_inspection_user_data <- df_inspection %>%
+    filter(!is.na(nmbr_moving_out), 
+           as.Date(time_start) > as.Date("4022-01-01")
+           ) %>% 
+    group_by(nmbr_inspection, date_inspection) %>% 
+    summarise(user_id = first(user_id),
+              time_start = first(time_start),
+              time_finish = last(time_finish),
+              items_qty = sum(item_qty > 0),
+              units_qty = sum(item_qty)) %>% 
+    ungroup() %>% 
+    # pivot_longer(cols = time_start:time_finish,
+    #              names_to = "flag_time",
+    #              values_to = "time_operation") %>% 
+    mutate(type_operation = "moving_inspection", .after = user_id) %>% 
+    rename(doc_nmbr = nmbr_inspection,
+           doc_date = date_inspection)
+
+customer_assembly_user_data <- assembly_current_month %>%
+    filter(!is.na(nmbr_sale_doc), 
+           as.Date(time_start) > as.Date("4022-01-01")) %>% 
+    # group_by(nmbr_assembly, date_assembly) %>% 
+    # summarise(user_id = first(picker),
+    #           time_start = first(time_start),
+    #           time_finish = last(time_finish)) %>% 
+    # ungroup() %>% 
+    select(nmbr_assembly, date_assembly, user_id = picker, time_start,
+           time_finish, items_qty, units_qty) %>% 
+    # pivot_longer(cols = time_start:time_finish,
+    #              names_to = "flag_time",
+    #              values_to = "time_operation") %>% 
+    mutate(type_operation = "customer_assembly", .after = user_id) %>% 
+    rename(doc_nmbr = nmbr_assembly,
+           doc_date = date_assembly)
+
+moving_assembly_user_data <- assembly_current_month %>%
+    filter(!is.na(nmbr_moving_out), 
+           as.Date(time_start) > as.Date("4022-01-01")) %>% 
+    # group_by(nmbr_assembly, date_assembly) %>% 
+    # summarise(user_id = first(picker),
+    #           time_start = first(time_start),
+    #           time_finish = last(time_finish)) %>% 
+    # ungroup() %>% 
+    select(nmbr_assembly, date_assembly, user_id = picker, time_start,
+           time_finish, items_qty, units_qty) %>% 
+    # pivot_longer(cols = time_start:time_finish,
+    #              names_to = "flag_time",
+    #              values_to = "time_operation") %>% 
+    mutate(type_operation = "moving_assembly", .after = user_id) %>% 
+    rename(doc_nmbr = nmbr_assembly,
+           doc_date = date_assembly)
+
+stores_worker_data <- bind_rows(supplier_inspection_user_data,
+                              moving_inspection_user_data,
+                              customer_assembly_user_data,
+                              moving_assembly_user_data) %>% 
+    arrange(user_id, time_start) %>% 
+    rowid_to_column() %>% 
+    mutate(date_start = as.Date(time_start),
+           date_finish = as.Date(time_finish)) %>% 
+    group_by(user_id) %>% 
+    mutate(next_doc_start = lead(time_start),
+           current_doc_finish = time_finish,
+           flag = ifelse(is.na(next_doc_start) | time_finish < next_doc_start,
+                         1,
+                         0)) %>% 
+    mutate(next_rowid = map_dbl(time_finish, ~max(rowid[time_start < .]))) %>% 
+    ungroup() %>% 
+    group_by(user_id, date_start) %>% 
+    mutate(first_doc_time = hour(min(time_start)),
+           last_doc_time  = hour(max(time_finish[date_start == date_finish]))) %>% 
+    ungroup()
+
+start_doc_time_by_workers <- stores_worker_data %>% 
+    distinct(user_id, date_start, first_doc_time)
+
+stores_worker_df <- stores_worker_data %>% 
+    mutate(next_time_finish = time_finish[next_rowid],
+           operation_time = ifelse(next_rowid == rowid,
+                                   as.integer(time_finish - time_start),
+                                   ifelse(next_rowid == rowid + 1,
+                                          ifelse(time_finish < next_time_finish,
+                                                 as.integer(time_start[next_rowid] - time_start),
+                                                 as.integer(time_start[next_rowid] - time_start) +
+                                                     time_finish - next_time_finish),
+                                          ifelse(time_finish < next_time_finish,
+                                                 as.integer(time_start[rowid + 1] - time_start),
+                                                 as.integer(time_start[rowid + 1] - time_start) +
+                                                     time_finish - next_time_finish)))) %>% 
+    left_join(select(start_doc_time_by_workers, user_id, date_start,
+                     start_finish_day = first_doc_time),
+              by = c("user_id", "date_finish" = "date_start")) %>% 
+    mutate(start_finish_day = ifelse(!is.na(start_finish_day),
+                                     start_finish_day,
+                                     hour(next_time_finish))) %>% 
+    mutate(working_time = case_when(
+        operation_time > 216000  ~  operation_time - (24*2 + start_finish_day +
+                                                          24 - (last_doc_time +
+                                                                1)) * 3600,
+        operation_time > 129600  ~  operation_time - (24*1 + start_finish_day +
+                                                          24 - (last_doc_time +
+                                                                1)) * 3600,
+        operation_time > 43200   ~  operation_time - (start_finish_day +
+                                                          24 - (last_doc_time +
+                                                                1)) * 3600,
+        TRUE                     ~  operation_time
+    )) %>% 
+    mutate(working_time = ifelse(working_time < 0,
+                                 working_time + 3600,
+                                 working_time)) %>% 
+    group_by(user_id, type_operation) %>% 
+    summarise(user_oper_working_time = round(sum(working_time) / 3600, 1),
+              doc_qty = n(),
+              items_qty = sum(items_qty),
+              units_qty = sum(units_qty)) %>% 
+    ungroup()
+
+
+workload_store_data <- stores_worker_df %>% 
+    group_by(user_id) %>% 
+    summarise(total_user_working_time = sum(user_oper_working_time)) %>% 
+    left_join(select(work_time_df, individ_id, subdiv_name, position_id,
+                     working_hours),
+              by = c("user_id" = "individ_id")) %>% 
+    filter(position_id %in% c("000000043", "000000042", "000000248"))
+
+workload_store <- workload_store_data %>% 
+    group_by(subdiv_name) %>% 
+    summarise(store_workload = round(sum(total_user_working_time) /
+                                         sum(working_hours), 3))
+
+fig_workload_store <- workload_store %>% 
+    ggplot(aes(x = reorder(subdiv_name, store_workload),
+               y = store_workload)) +
+    geom_bar(stat = "identity", fill = "lightblue") +
+    geom_text(
+        aes(label = scales::percent(store_workload)),
+        size = 7,
+        hjust = 1, position = position_dodge(.9)
+    ) +
+    coord_flip() +
+    theme_minimal() +
+    labs(x = "", y = "") +
+    theme(axis.text.y = element_text(size = 16),
+          axis.text.x = element_blank(),
+          panel.grid = element_blank())
+
+workers_with_workload <- workload_store_data %>% 
+    pull(position_id)
+    
+
+store_operations <- stores_worker_df %>% 
+    left_join(select(work_time_df, individ_id, subdiv_name),
+              by = c("user_id" = "individ_id")) %>%
+    group_by(subdiv_name, type_operation) %>%
+    summarise(total_operation_time = sum(user_oper_working_time)) %>% 
+    ungroup() %>% 
+    filter(!is.na(subdiv_name)) %>% 
+    group_by(subdiv_name) %>% 
+    mutate(operation_share = round(total_operation_time /
+                                       sum(total_operation_time), 2))
+
+fig_store_operations <- store_operations %>% 
+    ggplot(aes(x = factor(subdiv_name),
+           y = operation_share,
+           fill = factor(type_operation,
+                         levels = c("customer_assembly",
+                                    "moving_assembly",
+                                    "supplier_inspection",
+                                    "moving_inspection"),
+                         labels = c("Склад.зам.пок.",
+                                    "Склад.переміщ.",
+                                    "Прийом від пост.",
+                                    "Прийом переміщ.")))) + 
+    geom_bar(stat = "identity",
+             position = "fill") +
+    scale_y_continuous(breaks = seq(0, 1, .2), 
+                       label = scales::percent) +
+    geom_text(aes(label = scales::percent(operation_share)),
+              size = 3.5,
+              position = position_stack(vjust = 0.5)) +
+    scale_fill_brewer(palette = "Pastel1") +
+    coord_flip() +
+    labs(y = "", 
+         fill = "",
+         x = "",
+         title = "") +
+    theme_minimal() +
+    theme(legend.position = "top",
+          legend.text = element_text(size = 7.5),
+          legend.text.align = 0.8,
+          legend.spacing.x = unit(0.7, 'cm'),
+          axis.text.y = element_text(size = 11))
+
+distribution_stores_salaries <- current_month_salary %>% 
+    filter(subdiv_name %in% distribution_stores_subdiv,
+           !position_id %in% c(workers_with_workload,
+                               "000000222", "000000041")) %>% 
+    group_by(subdiv_name) %>% 
+    summarise(salary_witout_workload = sum(total_salary))
+
+distribution_stores_cost <- expenses_raw %>% 
+    filter(subdiv_name %in% distribution_stores_subdiv,
+           month == month(date_start))
+
+distribution_stores_storage_cost <- distribution_stores_cost %>% 
+    filter(expItems_parent %in% c("02 Орендна плата",
+                                  "03 Охорона, інкасація",
+                                  "031 Охорона труда , пожежна безпека",
+                                  "04 Комунальні послуги",
+                                  "05 Податки",
+                                  "06 Послуги зв'язку, інтернет",
+                                  "13 Господарські витрати",
+                                  "15 Оргтехніка, запчастини, обслуговування",
+                                  "27 Втрати ДЗ, Інвентаризації інші",
+                                  "41 Ремонти")
+    ) %>% 
+    group_by(subdiv_name) %>% 
+    summarise(total_storage_cost = sum(exp_sum))
+
+distribution_stores_other_cost <- distribution_stores_cost %>% 
+    filter(expItems_parent %in% c("17 Витрати на збут",
+                                  "181 Товар на власні потреби")
+    ) %>% 
+    group_by(subdiv_name) %>% 
+    summarise(total_other_cost = sum(exp_sum)) %>% 
+    mutate(total_other_cost = ifelse(subdiv_name == "Логістика, Луцьк",
+                                     total_other_cost / 2,
+                                     total_other_cost))
+
+cost_operations <- stores_worker_df %>% 
+    filter(!is.na(user_id)) %>% 
+    group_by(user_id) %>% 
+    mutate(operation_share = round(user_oper_working_time /
+                                       sum(user_oper_working_time), 3)) %>% 
+    left_join(select(current_month_salary, individ_id, subdiv_name,
+                     total_salary),
+              by = c("user_id" = "individ_id")) %>% 
+    filter(subdiv_name %in% distribution_stores_subdiv) %>% 
+    mutate(operation_cost = total_salary * operation_share) %>% 
+    group_by(subdiv_name, type_operation) %>% 
+    summarise(direct_operation_cost = sum(operation_cost),
+              items_qty = sum(items_qty),
+              units_qty = sum(units_qty)) %>% 
+    ungroup() %>% 
+    left_join(distribution_stores_salaries, by = "subdiv_name") %>% 
+    left_join(distribution_stores_other_cost, by = "subdiv_name") %>%
+    left_join(select(store_operations, - total_operation_time),
+              by = c("subdiv_name", "type_operation")) %>%
+    mutate(total_operation_cost = direct_operation_cost +
+               (salary_witout_workload + total_other_cost) * operation_share,
+           operation_cost_per_item = round(total_operation_cost / items_qty, 2),
+           operation_cost_per_unit = round(total_operation_cost / units_qty, 2))
+
+library(reactable)
+
+cost_operations_tbl <- cost_operations %>%
+    select(subdiv_name, type_operation, items_qty, units_qty,
+           operation_cost_per_unit) %>% 
+    mutate(type_operation = recode(type_operation,
+                                   "customer_assembly"="Складання замов.покуп.",
+                                   "moving_assembly" = "Складання переміщ.",
+                                   "supplier_inspection" = "Прийом від постач.",
+                                   "moving_inspection" = "Прийом переміщ.")) %>% 
+    reactable(
+        bordered = TRUE,
+        pagination = FALSE,
+        highlight = TRUE,
+        striped = TRUE,
+        groupBy = c("subdiv_name"),
+        defaultColDef = colDef(
+            align = "left",
+            headerStyle = list(background = "grey"),
+            style = list(fontSize = '12px')),
+        columns = list(
+            subdiv_name = colDef(name = "Підрозділ"),
+            type_operation = colDef(name = "Тип операції"),
+            items_qty  = colDef(name = "Кіл.SKU",
+                                maxWidth = 80,
+                                format = colFormat(separators = TRUE)),
+            units_qty  = colDef(name = "Кіл.од.",
+                                maxWidth = 80,
+                                format = colFormat(separators = TRUE)),
+            operation_cost_per_unit = colDef(name = "Вартість на од-цю",
+                                              maxWidth = 90
+                                   )
+        ))
+
+
+store_space__workload <- tibble(store = distribution_stores) %>% 
+    mutate(data = map(store, store_space_workload_fn)) %>% 
+    unnest(cols = c(data)) %>% 
+    left_join(select(ref_store, store_id, store_name),
+              by = c("store" = "store_id"))
+
+fig_store_space_workload <- store_space__workload %>% 
+    ggplot(aes(x = reorder(store_name, store_workload),
+               y = store_workload)) +
+    geom_bar(stat = "identity", fill = "lightblue") +
+    geom_text(
+        aes(label = scales::percent(store_workload)),
+        size = 7,
+        hjust = 1, position = position_dodge(.9)
+    ) +
+    coord_flip() +
+    theme_minimal() +
+    labs(x = "", y = "") +
+    theme(axis.text.y = element_text(size = 16),
+          axis.text.x = element_blank(),
+          panel.grid = element_blank())   
+```
+
+
+
+Основні показники {data-icon="fa-bullseye"}
+=======================================================================
+
+Row {data-height=100}
+-----------------------------------------------------------------------
+
+### Частка логістичних витрат у продажу
+
+```{r}
+valueBox(
+  value = scales::percent(logistic_exp_share_cur_month, accuracy = 0.1))
+```
+
+### Логістичні витрати на од-цю проданих товарів, грн
+
+```{r}
+valueBox(
+  value = logistic_exp_per_unit)
+```
+
+### Рівень доступності запасів товарів гр.А
+
+```{r}
+valueBox(
+  value = scales::percent(total_available_level, accuracy = 0.1),
+  color = case_when(
+                    total_available_level <  0.9 ~ "danger",
+                    total_available_level <  0.95 ~ "warning",
+                    total_available_level >= 0.95 ~ "success"
+                    )
+)
+```
+
+Row {data-height=150}
+-----------------------------------------------------------------------
+
+### Частка логістичних витрат у продажу з початку року
+
+```{r}
+ggplotly(fig1, tooltip = "y") %>% 
+    config(displayModeBar = FALSE)
+```
+
+### Логістичні витрати на од-цю проданих товарів з початку року
+
+```{r}
+ggplotly(fig2, tooltip = "y") %>% 
+    config(displayModeBar = FALSE)
+```
+
+### Найгірші підрозділи з рівеня доступності запасів
+
+```{r}
+fig_available_level
+```
+
+Row {data-height=100}
+-----------------------------------------------------------------------
+
+### Ідеальне замовлення покупця
+
+```{r}
+valueBox(
+  value = scales::percent(perfect_customer_order, accuracy = 0.1),
+  color = case_when(
+                    perfect_customer_order <  0.8 ~ "danger",
+                    perfect_customer_order <  0.9 ~ "warning",
+                    perfect_customer_order >= 0.9 ~ "success"
+                    )
+)
+```
+
+### Ідеальне складання замовлення покупця
+
+```{r}
+valueBox(
+  value = scales::percent(perfect_assembly_customer_orders, accuracy = 0.1),
+  color = case_when(
+                    perfect_assembly_customer_orders <  0.9 ~ "danger",
+                    perfect_assembly_customer_orders <  0.95 ~ "warning",
+                    perfect_assembly_customer_orders >= 0.95 ~ "success"
+                    )
+)
+```
+
+### Ідеальна доставка замовлення покупця
+
+```{r}
+valueBox(
+  value = scales::percent(perfect_customer_delivery , accuracy = 0.1),
+  color = case_when(
+                    perfect_customer_delivery  <  0.9 ~ "danger",
+                    perfect_customer_delivery  <  0.95 ~ "warning",
+                    perfect_customer_delivery  >= 0.95 ~ "success"
+                    )
+)
+```
+
+Row {data-height=100}
+-----------------------------------------------------------------------
+
+### Ідеальне внутрішне переміщення
+
+```{r}
+valueBox(
+  value = scales::percent(perfect_moving_out, accuracy = 0.1),
+  color = case_when(
+                    perfect_moving_out <  0.8 ~ "danger",
+                    perfect_moving_out <  0.9 ~ "warning",
+                    perfect_moving_out >= 0.9 ~ "success"
+                    )
+)
+```
+
+### Ідеальне складання внутрішнього переміщення
+
+```{r}
+valueBox(
+  value = scales::percent(perfect_assembly_moving_out, accuracy = 0.1),
+  color = case_when(
+                    perfect_assembly_moving_out <  0.9 ~ "danger",
+                    perfect_assembly_moving_out <  0.95 ~ "warning",
+                    perfect_assembly_moving_out >= 0.95 ~ "success"
+                    )
+)
+```
+
+### % своєчасно доставлених внутрішних переміщень
+
+```{r}
+valueBox(
+  value = scales::percent(on_time_delivery_moving_out, accuracy = 0.1),
+  color = case_when(
+                    on_time_delivery_moving_out <  0.9 ~ "danger",
+                    on_time_delivery_moving_out <  0.95 ~ "warning",
+                    on_time_delivery_moving_out >= 0.95 ~ "success"
+                    )
+)
+```
+
+Row {data-height=400}
+-----------------------------------------------------------------------
+
+### Логістична схема надходжень товарів по складам {.no-padding}
+
+```{r}
+fig_receipt_by_store
+```
+
+### Структура надходжень та продажу по організаціям {.no-padding}
+
+```{r}
+fig_organization_analysis
+```
+
+### Умови закупівлі товарів від поствчальників {.no-padding}
+
+```{r}
+fig_purchase_cond
+```
+
+
+Транспортна логістика {data-icon="fa-truck"}
+=======================================================================
+
+Row {data-height=100}
+-----------------------------------------------------------------------
+
+### Коеф-нт використання вантажопідйомності (зважений)
+
+```{r}
+valueBox(
+  value = scales::percent(total_load_factor, accuracy = 0.1),
+  color = case_when(
+                    total_load_factor <  0.6 ~ "danger",
+                    total_load_factor <  0.75 ~ "warning",
+                    total_load_factor >= 0.75 ~ "success"
+                    )
+)
+```
+
+### Собівартість 1км, грн
+
+```{r}
+valueBox(
+  value = cost_1km)
+```
+
+
+### Завантаженість персоналу (водіїв)
+
+```{r}
+valueBox(
+  value = scales::percent(avr_deliv_workload, accuracy = 0.1),
+  color = case_when(
+                    avr_deliv_workload <  0.8 ~ "danger",
+                    avr_deliv_workload <  0.9 ~ "warning",
+                    avr_deliv_workload >= 0.9 ~ "success"
+                    )
+)
+```
+
+
+Row {data-height=250}
+-----------------------------------------------------------------------
+
+### Найгірші авто з коеф-нту використання вантажопідйомності
+
+```{r}
+fig_load_factor
+```
+
+### Найгірші авто з собівартісті 1км, грн
+
+```{r}
+fig_1km_cost
+```
+
+### Найгірші співробітники з завантаженості
+
+```{r}
+fig_deliv_workload
+```
+
+
+Row {data-height=100}
+-----------------------------------------------------------------------
+
+### Собівартість доставки покупцям, грн
+
+```{r}
+valueBox(
+  value = avr_delivery_cost)
+```
+
+### Середня сума доставлених покупцям товарів, грн (медіана)
+
+```{r}
+valueBox(
+  value = scales::comma(total_avr_deliv_sale_doc_amount),
+  color = case_when(
+                    total_avr_deliv_sale_doc_amount <  avr_delivery_cost * 1.2 /
+                        0.2 ~ "danger",
+                    total_avr_deliv_sale_doc_amount <  1000 ~ "warning",
+                    total_avr_deliv_sale_doc_amount >= 1000 ~ "success"
+                    )
+)
+```
+
+Row {data-height=250}
+-----------------------------------------------------------------------
+
+### Найгірші авто із собівартості доставки покупцям
+
+```{r}
+fig_deliv_cost
+```
+
+### Найгірші підрозділи з середньої суми доставлених товарів
+
+```{r}
+fig_avr_delivery_sale_doc_sum
+```
+
+Row {data-height=100}
+-----------------------------------------------------------------------
+
+### Ідеальна доставка замовлення покупця
+
+```{r}
+valueBox(
+  value = scales::percent(perfect_cust_delivery , accuracy = 0.1),
+  color = case_when(
+                    perfect_cust_delivery  <  0.75 ~ "danger",
+                    perfect_cust_delivery  <  0.85 ~ "warning",
+                    perfect_cust_delivery  >= 0.85 ~ "success"
+                    )
+)
+```
+
+### % своєчасно доставлених замовлень покупців
+
+```{r}
+valueBox(
+  value = scales::percent(ontime_delivery, accuracy = 0.1),
+  color = case_when(
+                    ontime_delivery <  0.8 ~ "danger",
+                    ontime_delivery <  0.9 ~ "warning",
+                    ontime_delivery >= 0.9 ~ "success"
+                    )
+)
+```
+
+### % доставлених без зауважень замовлень покупців
+
+```{r}
+valueBox(
+  value = scales::percent(no_complaints_customer_orders_delivery, accuracy = 0.1),
+  color = case_when(
+                    no_complaints_customer_orders_delivery <  0.8 ~ "danger",
+                    no_complaints_customer_orders_delivery <  0.9 ~ "warning",
+                    no_complaints_customer_orders_delivery >= 0.9 ~ "success"
+                    )
+)
+```
+
+Складська логістика {data-icon="fa-warehouse"}
+=======================================================================
+
+Row {data-height=100}
+-----------------------------------------------------------------------
+
+### Ідеальне складання замовлення покупця
+
+```{r}
+valueBox(
+  value = scales::percent(perfect_assembly_customer_orders, accuracy = 0.1),
+  color = case_when(
+                    perfect_assembly_customer_orders <  0.9 ~ "danger",
+                    perfect_assembly_customer_orders <  0.95 ~ "warning",
+                    perfect_assembly_customer_orders >= 0.95 ~ "success"
+                    )
+)
+```
+
+### % своєчасно зібраних замовлень покупців
+
+```{r}
+valueBox(
+  value = scales::percent(on_time_assemblies , accuracy = 0.1),
+  color = case_when(
+                    on_time_assemblies  <  0.9 ~ "danger",
+                    on_time_assemblies  <  0.98 ~ "warning",
+                    on_time_assemblies  >= 0.98 ~ "success"
+                    )
+)
+```
+
+### % зібраних без помилок замовлень покупців
+
+```{r}
+valueBox(
+  value = scales::percent(no_complaints_assemblies, accuracy = 0.1),
+  color = case_when(
+                    no_complaints_assemblies <  0.95 ~ "danger",
+                    no_complaints_assemblies <  0.99 ~ "warning",
+                    no_complaints_assemblies >= 0.99 ~ "success"
+                    )
+)
+```
+
+Row {data-height=100}
+-----------------------------------------------------------------------
+
+### Ідеальне складання внутрішнього переміщення
+
+```{r}
+valueBox(
+  value = scales::percent(perfect_assembly_moving_out, accuracy = 0.1),
+  color = case_when(
+                    perfect_assembly_moving_out <  0.9 ~ "danger",
+                    perfect_assembly_moving_out <  0.95 ~ "warning",
+                    perfect_assembly_moving_out >= 0.95 ~ "success"
+                    )
+)
+```
+
+### % своєчасно зібраних внутрішних переміщень
+
+```{r}
+valueBox(
+  value = scales::percent(on_time_assemblies_moving_out, accuracy = 0.1),
+  color = case_when(
+                    on_time_assemblies_moving_out <  0.95 ~ "danger",
+                    on_time_assemblies_moving_out <  0.98 ~ "warning",
+                    on_time_assemblies_moving_out >= 0.98 ~ "success"
+                    )
+)
+```
+
+### % зібраних без помилок внутрішних переміщень
+
+```{r}
+valueBox(
+  value = scales::percent(no_complaints_assemblies_moving_out, accuracy = 0.1),
+  color = case_when(
+                    no_complaints_assemblies_moving_out <  0.95 ~ "danger",
+                    no_complaints_assemblies_moving_out <  0.99 ~ "warning",
+                    no_complaints_assemblies_moving_out >= 0.99 ~ "success"
+                    )
+)
+```
+
+Row {data-height=100}
+-----------------------------------------------------------------------
+
+### Середній час на приймання від постачальників, хв.
+
+```{r}
+valueBox(
+  value = avr_suppl_inspection_time)
+```
+
+### Середній час на приймання по внутр.переміщ., хв.
+
+```{r}
+valueBox(
+  value = avr_moving_inspection_time)
+```
+
+Row {data-height=200}
+-----------------------------------------------------------------------
+
+### Середній час на приймання від постачальників за складами, хв.(кіл.док.) {.no-padding}
+
+```{r}
+fig_suppl_inspection_by_store
+```
+
+### Середній час на приймання за внутр.переміщ. за складами, хв.(кіл.док.) {.no-padding}
+
+```{r}
+fig_moving_inspection_by_store 
+```
+
+Row {data-height=200}
+-----------------------------------------------------------------------
+
+### Постачальники з найгіршим середнім часом на приймання, хв. {.no-padding}
+
+```{r}
+fig_suppl_inspection_by_supplier
+```
+
+### Склади-віправ. з найгіршим середнім часом на приймання, хв.(кіл.док.) {.no-padding}
+
+```{r}
+#fig_moving_inspection_by_sender
+```
+
+
+Row {data-height=200}
+-----------------------------------------------------------------------
+
+### Постачальники з найгіршим % відхілень у поставках (заг.кіл.рядків) {.no-padding}
+
+```{r}
+fig_suppl_inspection_deviation
+```
+
+### Склади-віправ. з найгіршим % відхілень у поставках (заг.кіл.рядків) {.no-padding}
+
+```{r}
+fig_moving_inspection_deviation
+```
+
+Row {data-height=100}
+-----------------------------------------------------------------------
+
+### Середній час на збирання замовлень покупців, хв.
+
+```{r}
+valueBox(
+  value = avr_customer_assembly_time)
+```
+
+### Середній час на збирання внутр.переміщ., хв.
+
+```{r}
+valueBox(
+  value = avr_moving_assembly_time)
+```
+
+Row {data-height=200}
+-----------------------------------------------------------------------
+
+### Середній час на збирання замовлень покупців за складами, хв.(кіл.док.)
+
+```{r}
+fig_customer_assembly_by_store
+```
+
+### Середній час на збирання за внутр.переміщ. за складами, хв.(кіл.док.)
+
+```{r}
+fig_moving_assembly_by_store
+```
+
+Row {data-height=200}
+-----------------------------------------------------------------------
+
+### Завантаженність персоналу складів
+
+```{r}
+fig_workload_store
+```
+
+### Завантаженність складського полочного простору
+
+```{r}
+fig_store_space_workload
+```
+
+Row {data-height=300}
+-----------------------------------------------------------------------
+
+### Структура складських операцій (на підставі витраченого часу) {.no-padding}
+
+```{r}
+fig_store_operations
+```
+
+### Вартість складських операцій на одиницю товару
+
+```{r}
+cost_operations_tbl
+```
