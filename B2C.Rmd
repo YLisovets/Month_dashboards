@@ -6,7 +6,7 @@ output:
      vertical_layout: scroll
      theme:
       version: 4
-      navbar-bg: "red"
+      primary: "red"
 ---
 
 ```{r setup, include=FALSE}
@@ -45,14 +45,15 @@ cost_raw_data <- cost_data(date_start + years(2000),
                                 "Хмельницький см роздріб",
                                 subdiv_name))
 
-sale_plan_df <- sale_plan_data(date_start + years(2000),
-                          date_finish + years(2000)) %>% 
-    filter(project == "Розница") %>% 
-    mutate(subdiv_name = ifelse(subdiv_name == "Копіцентр ХМ СМ",
-                                "Хмельницький см роздріб",
-                                subdiv_name)) %>% 
-    group_by(subdiv_name) %>% 
-    summarise(plan_sum = sum(saleplan_doc_sum))
+# sale_plan_df <- sale_plan_data(date_start + years(2000),
+#                           date_finish + years(2000)) %>%
+#     filter(project == "Розница",
+#            script_name == "План В2С по КН") %>%
+#     mutate(subdiv_name = ifelse(subdiv_name == "Копіцентр ХМ СМ",
+#                                 "Хмельницький см роздріб",
+#                                 subdiv_name)) %>%
+#     group_by(subdiv_name) %>%
+#     summarise(plan_sum = sum(saleplan_doc_sum))
 
 plan_indicators <- plan_data(date_start + years(2000),
                              date_finish + years(2000)) %>% 
@@ -61,6 +62,8 @@ plan_indicators <- plan_data(date_start + years(2000),
     select(-plan_period) %>% 
     pivot_wider(names_from = indicator_name,
                 values_from = value)
+
+names(plan_indicators)[c(2,3)] <- c("checks_plan", "check_sku_plan")
 
 plan_ind_nrow <- nrow(plan_indicators)
 
@@ -86,9 +89,12 @@ regular_cust <- regular_cust_data(date_start,
 
 
 plan_retail_data <- sale_plan_retail(date_start + years(2000),
-                                     date_finish + years(2000)) %>% 
+                                     date_finish + years(2000)) %>%
+    mutate(subdiv_name = ifelse(subdiv_name == "Копіцентр ХМ СМ",
+                                "Хмельницький см роздріб",
+                                subdiv_name)) %>%
     group_by(subdiv_name) %>% 
-    summarise(plan_revenue = sum(plan_sale),
+    summarise(plan_sum = sum(plan_sale),
               plan_profit = sum(plan_profit))
 ```
 
@@ -123,7 +129,7 @@ work_duration <- sale_check_df %>%
            work_duration = as.integer(finish_work - start_work) / 3600 -
                diff_first + diff_last) %>% 
     group_by(subdiv_name) %>% 
-    summarise(period_work_time = sum(work_duration))
+    summarise(period_work_time = sum(work_duration, na.rm = TRUE))
 
 empl_work_time_retail <- empl_work_time_data %>%
     filter(!position_id %in% c("000000049", "000000036", "000000200",
@@ -180,41 +186,40 @@ retail_df <- sale_check_df %>%
     left_join(select(area_data, subdiv_name:trade_area)) %>% 
     left_join(cost_df) %>% 
     left_join(work_duration) %>%
-    left_join(empl_work_time_retail) %>%
-    left_join(sale_plan_df) %>% 
+    left_join(empl_work_time_retail, by = "subdiv_name") %>%
+    left_join(plan_retail_data) %>% 
     left_join(plan_indicators) %>% 
     left_join(sale_prev_year) %>%
     left_join(regular_cust) %>%
     mutate(across(where(is.numeric), ~ifelse(is.na(.), 0, .))) %>% 
     janitor::adorn_totals(where = "row", name = "ВСЕГО") %>%
     mutate(plan_implement = round(revenue / plan_sum, 3),
-           revenue_change = ifelse(revenue_prev_year > 0,
-                                   round(revenue / revenue_prev_year - 1, 3),
-                                   0),
-           checks_nmbr_impl = ifelse(plan_ind_nrow > 0,
-                                     round(total_checks / `КількістьЧеківПлан`,
+           revenue_growth = ifelse(revenue_prev_year > 0, 1, 0) *
+                                   round(revenue / revenue_prev_year, 2),
+           checks_nmbr_impl = ifelse(plan_ind_nrow > 0, 1, 0) *
+                                     round(total_checks / checks_plan,
                                            3),
-                                     0),
-           total_checks_change = ifelse(checks_prev_year > 0,
+           total_checks_growth = ifelse(checks_prev_year > 0, 1, 0) *
                                         round(total_checks / 
-                                                  checks_prev_year - 1, 3),
-                                        0),
+                                                  checks_prev_year, 2),
            one_item_checks_share = round(one_item_checks_qty/total_checks, 3),
            avr_check_sum = round(revenue / total_checks, 1),
-           avr_check_impl = ifelse(plan_ind_nrow > 0,
+           avr_check_impl = ifelse(plan_ind_nrow > 0, 1, 0) *
                                    round(avr_check_sum /
-                                      (plan_sum / `КількістьЧеківПлан`), 3),
-                                   0),
-           avr_check_change = ifelse(checks_prev_year > 0,
+                                      (plan_sum / checks_plan), 3),
+           avr_check_growth = ifelse(checks_prev_year > 0, 1, 0) *
                                      round(avr_check_sum / (revenue_prev_year /
-                                                         checks_prev_year) - 1,
-                                           3),
-                                     0),
+                                                         checks_prev_year), 2),
            avr_check_sku = round(total_items / total_checks, 1),
-           avr_check_sku_impl = ifelse(plan_ind_nrow > 0,
+           row_n = row_number(),
+           check_sku_plan = ifelse(row_n == max(row_n),
+                                   weighted.mean(check_sku_plan[1:(max(row_n)-1)],
+                                                 checks_plan[1:(max(row_n)-1)]),
+                                   check_sku_plan),
+           avr_check_sku_impl = ifelse(plan_ind_nrow > 0, 1, 0) *
                                        round(avr_check_sku /
-                                           (`План продаж,шт В2С`), 3),
-                                       0),
+                                           (check_sku_plan), 3),
+           
            share_regular_cust = round(total_regular_checks / total_checks, 3),
            net_discount = discounts - reg_cust_bonus_reduced,
            net_discount_share = round(net_discount / revenue, 3),
@@ -223,7 +228,7 @@ retail_df <- sale_check_df %>%
            profitability = round(gross_profit / revenue, 3),
            gmros = round(gross_profit / trade_area),
            gmrol = round(gross_profit / subdiv_empl_work_time),
-           row_n = row_number(),
+           
            staff_factor = subdiv_empl_work_time / period_work_time,
            
            staff_factor = ifelse(row_n == max(row_n),
@@ -252,19 +257,11 @@ total_gmros <- retail_df$gmros[total_shops + 1]
 ```{r checks_data}
 checks_nmbr_inplemention <- retail_df$checks_nmbr_impl[total_shops + 1] * 100
 avr_check_inplemention <- retail_df$avr_check_impl[total_shops + 1] * 100
-avr_check_sku_plan <- ifelse(plan_ind_nrow > 0,
-                             round(weighted.mean(
-                                retail_df$`План продаж,шт В2С`[1:total_shops],
-                                retail_df$plan_sum[1:total_shops]),
-                                2),
-                             0)
-avr_check_sku_inplemention <- ifelse(plan_ind_nrow > 0,
-                              round(retail_df$avr_check_sku[total_shops + 1] /
-                                    avr_check_sku_plan * 100, 1),
-                              0)
+avr_check_sku_plan <- retail_df$check_sku_plan[total_shops + 1]
+avr_check_sku_inplemention <- retail_df$avr_check_sku_impl[total_shops + 1] * 100
 avr_check_plan <- ifelse(plan_ind_nrow > 0,
                          round(retail_df$plan_sum[total_shops + 1] /
-                            retail_df$`КількістьЧеківПлан`[total_shops + 1], 1),
+                            retail_df$checks_plan[total_shops + 1], 1),
                          0)
 
 last_4week_data <- sale_check_df %>% 
@@ -343,7 +340,8 @@ p <- items_data %>%
     left_join(distinct(select(ref_shops, subdiv_name, parent_shop),
                        subdiv_name, .keep_all = TRUE)) %>% 
     ggplot(aes(x = reorder(subdiv_name, items_nmbr),
-               y = items_nmbr, fill = parent_shop)) +
+               y = items_nmbr, fill = parent_shop,
+               text = items_nmbr)) +
     geom_bar(stat="identity") +
     scale_fill_viridis_d() +
     labs(x = "", y = "Кількість проданих SKU", fill = "Категорія") +
@@ -609,8 +607,9 @@ Row
 mean_gmros <- mean(retail_df$gmros[1:total_shops])
 
 retail_df %>% 
-    select(subdiv_name, parent_shop, trade_area, revenue, revenue_change, 
-           net_discount_share, rev_per_sq, gross_profit, profitability, gmros) %>% 
+    select(subdiv_name, parent_shop, trade_area, revenue, plan_implement,
+           revenue_growth, net_discount_share, rev_per_sq, gross_profit,
+           profitability, gmros) %>% 
     filter(subdiv_name != "ВСЕГО") %>%
     replace_na(list(revenue_change = 0)) %>% 
     reactable(striped = TRUE,
@@ -628,17 +627,28 @@ retail_df %>%
                              minWidth = 60,
                              format = colFormat(separators = TRUE,
                                                 digits = 0)),
-            revenue_change = colDef(name = "Зм.(рік)",
-                                    maxWidth = 65, 
+            plan_implement = colDef(name = "Викон.плану",
+                                    maxWidth = 70, 
                           style = function(value) {
-                                          color <- if (value > 0) {
+                                          color <- if (value > 1) {
                                               "#008000"
-                                          } else if (value < 0) {
+                                          } else if (value < 1) {
                                               "#e00000"
                                           }
                                           list(color = color, fontSize = 14)
                                       },
-                          format = colFormat(percent = TRUE, digits = 1)),
+                          format = colFormat(percent = TRUE, digits = 0)),
+            revenue_growth = colDef(name = "TP",
+                                    maxWidth = 50, 
+                          style = function(value) {
+                                          color <- if (value > 1) {
+                                              "#008000"
+                                          } else if (value < 1) {
+                                              "#e00000"
+                                          }
+                                          list(color = color, fontSize = 14)
+                                      },
+                          format = colFormat(digits = 2)),
             net_discount_share = colDef(name = "Знижки",
                                     maxWidth = 80,
                                     format = colFormat(percent = TRUE)),
@@ -667,7 +677,7 @@ retail_df %>%
                                   format = colFormat(separators = TRUE,
                                                      digits = 0)),
             profitability = colDef(name = "Рентаб.",
-                                   minWidth = 50,
+                                   minWidth = 45,
                                    aggregate = JS("function(values, rows) {
                                     let totalProfit = 0
                                     let totalRevenue = 0
@@ -680,7 +690,7 @@ retail_df %>%
                                    format = colFormat(percent = TRUE,
                                                       digits = 1)),
             gmros = colDef(name = "GMROS",
-                           minWidth = 50,
+                           minWidth = 45,
                            aggregate = JS("function(values, rows) {
                                     let totalProfit = 0
                                     let totalArea = 0
@@ -806,9 +816,9 @@ Row
 
 ```{r}
 retail_df %>%
-    select(subdiv_name, parent_shop, revenue, total_checks, total_checks_change,
+    select(subdiv_name, parent_shop, revenue, total_checks, total_checks_growth,
            one_item_checks_share, share_regular_cust, avr_check_sum, 
-           avr_check_change, avr_check_sku, avr_unit_sum,
+           avr_check_growth, avr_check_sku, avr_unit_sum,
            reg_cust_bonus_reduced, reg_cust_bonus_acrrued) %>%
     filter(subdiv_name != "ВСЕГО") %>%
     replace_na(list(total_checks_change = 0,
@@ -828,18 +838,18 @@ retail_df %>%
                                   minWidth = 60,
                                   format = colFormat(separators = TRUE,
                                                      digits = 0)),
-            total_checks_change = colDef(
-                name = "Зм.(рік)",
-                maxWidth = 60, 
+            total_checks_growth = colDef(
+                name = "TP",
+                maxWidth = 50, 
                 style = function(value) {
-                                          color <- if (value > 0) {
+                                          color <- if (value > 1) {
                                               "#008000"
-                                          } else if (value < 0) {
+                                          } else if (value < 1) {
                                               "#e00000"
                                           }
                                           list(color = color, fontSize = 14)
                                       },
-                format = colFormat(percent = TRUE)),
+                format = colFormat(digits = 2)),
             one_item_checks_share = colDef(name = "1SKU",
                                            minWidth = 50,
                                            format = colFormat(percent = TRUE)),
@@ -864,18 +874,18 @@ retail_df %>%
                                                             'white',
                                                             'yellowgreen'))
                 ),
-           avr_check_change = colDef(
-                name = "Зм.(рік)",
-                maxWidth = 60, 
+           avr_check_growth = colDef(
+                name = "TP",
+                maxWidth = 50, 
                 style = function(value) {
-                                          color <- if (value > 0) {
+                                          color <- if (value > 1) {
                                               "#008000"
-                                          } else if (value < 0) {
+                                          } else if (value < 1) {
                                               "#e00000"
                                           }
                                           list(color = color, fontSize = 14)
                                       },
-                format = colFormat(percent = TRUE)), 
+                format = colFormat(digits = 2)), 
            avr_check_sku = colDef(aggregate = "mean",
                                   name = "Кіл.SKU",
                                   minWidth = 50,
@@ -897,11 +907,11 @@ retail_df %>%
         ),
         columnGroups = list(
             colGroup(name = "Чеки", columns = c("total_checks",
-                                                "total_checks_change",
+                                                "total_checks_growth",
                                                 "one_item_checks_share",
                                                 "share_regular_cust")),
             colGroup(name = "Середній чек", columns = c("avr_check_sum",
-                                                       "avr_check_change")),
+                                                       "avr_check_growth")),
             colGroup(name = "Характеристики чека", columns = c("avr_check_sku",
                                                                "avr_unit_sum")),
             colGroup(name = "Бонуси", columns = c("reg_cust_bonus_acrrued",
@@ -1120,7 +1130,7 @@ Row {data-height=500}
 ### Кількість проданих SKU по магазинам {data-width=500}
 
 ```{r}
-plotly::ggplotly(p, tooltip = "y")
+plotly::ggplotly(p, tooltip = "text")
 ```
 
 ### Найпопулярніші товари за кількістю чеків (кількість магазинів) {data-width=500}

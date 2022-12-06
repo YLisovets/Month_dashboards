@@ -6,7 +6,7 @@ output:
     vertical_layout: scroll
     theme:
       version: 4
-      navbar-bg: "red"
+      primary: "red"
 ---
 
 ```{r setup, include=FALSE}
@@ -921,7 +921,8 @@ cleared_deliveries <- delivery_with_sale_doc %>%
            deliv_order_store_id, deliv_order_store, intermediate_store,
            deliv_address, nmbr_sale_doc:doc_sum) %>% 
     left_join(select(delivery_order_raw, nmbr_deliv_order, date_deliv_order,
-                     nmbr_moving_out, date_moving_out, recipient_store),
+                     deliv_type, nmbr_moving_out, date_moving_out,
+                     recipient_store),
               by = c("nmbr_deliv_order", "date_deliv_order")) %>% 
     left_join(select(ref_store, store_id,
                      distrib_store_sender = distribution_store),
@@ -940,7 +941,8 @@ cleared_deliveries <- delivery_with_sale_doc %>%
                  (deliv_order_store_id %in% c("000000001") |
                       (!is.na(intermediate_store) & intermediate_store ==
                            "Головний склад"))),
-           !(route_id == "000000106" & !is.na(nmbr_moving_out))
+           !(route_id == "000000106" & !is.na(nmbr_moving_out)),
+           !(deliv_type %in% c("Перевозчик") & !is.na(nmbr_moving_out))
            )
 
 deliveries_summary <- cleared_deliveries %>% 
@@ -982,34 +984,41 @@ distance_moving_out_data <- distinct_moving_out %>%
     filter(!(direction == "Хмельницкий" & !str_detect(store_address,
                                                    "Хмельницький")))
 
-sender_store <- distance_moving_out_data %>% 
-    group_by(id) %>% 
-    filter(store == "store_id") %>% 
-    ungroup() %>% 
-    select(id, store_address)
+# sender_store <- distance_moving_out_data %>% 
+#     group_by(id) %>% 
+#     filter(store == "store_id") %>% 
+#     ungroup() %>% 
+#     select(id, store_address)
 
 
 library(tidygeocoder)
 library(sf)
 library(osrm)
 
-store_geocode <- unique(distance_moving_out_data$store_address) %>% 
-    str_replace("м.", "") %>% 
-    geo(method = "osm")
+store_geocode <- distance_moving_out_data %>% 
+    distinct(store_address) %>% 
+    mutate(store_address = str_replace(store_address, "м.", ""),
+           store_address = str_replace(store_address, "вул. проспект",
+                                       "проспект"),
+           store_address = str_trim(store_address, side = "left")) %>% 
+    geocode(method = "osm",
+            address = store_address)
 
 distance_fn <- function(data) {
     route <- data %>% 
-        left_join(store_geocode, by = c("store_address" = "address")) %>% 
-        st_as_sf(coords = c("long", "lat"), crs = 4326) %>% 
-        osrmTrip(returnclass = "sf")
+        left_join(store_geocode, by = "store_address") %>%
+        st_as_sf(coords = c("long", "lat"), crs = 4326) %>%
+        osrmTrip()
     
     distance <- route[[1]]$summary$distance
 }
 
 distance_moving_out <- distance_moving_out_data %>% 
     select(id, store_address) %>% 
-    add_row(sender_store) %>% 
+    #add_row(sender_store) %>% 
     mutate(store_address = str_replace(store_address, "м.", ""),
+           store_address = str_replace(store_address,"вул. проспект",
+                                       "проспект"),
            store_address = str_trim(store_address, side = "left")) %>% 
     group_by(id) %>% 
     nest() %>% 
@@ -1048,7 +1057,8 @@ auto_total_distance <- delivery_raw %>%
     distinct(nmbr_delivery, date_delivery, .keep_all = TRUE) %>% 
     mutate(distance = ifelse(speedo_finish > 0 & speedo_finish > speedo_start,
                              speedo_finish - speedo_start,
-                             0)) %>% 
+                             0)) %>%
+    filter(!is.na(vehicle_name)) %>% 
     group_by(vehicle_name) %>% 
     summarise(auto_total_distance = sum(distance))
 
@@ -1174,15 +1184,21 @@ distribution_stores_name <- distribution_stores_name_subdiv %>%
 distribution_stores_subdiv <- distribution_stores_name_subdiv %>% 
     pull(subdiv_name)
 
+max_avr_inspection_duration <- max(
+    suppl_inspection_by_store$avr_inspection_duration[
+        suppl_inspection_by_store$store %in% distribution_stores_name],
+    na.rm = TRUE)
+
 fig_suppl_inspection_by_store <- suppl_inspection_by_store %>% 
     filter(store %in% distribution_stores_name) %>% 
     ggplot(aes(x = store,
                y = avr_inspection_duration)) +
     geom_bar(stat = "identity", fill = "lightblue") +
+    ylim(0, max_avr_inspection_duration * 1.25) +
     geom_text(
-        aes(label = paste0(avr_inspection_duration, "(", inspection_qty, ")")),
+        aes(label = paste0(avr_inspection_duration, "\n(", inspection_qty, ")")),
         size = 7,
-        hjust = 1, position = position_dodge(.9)
+        hjust = 0, position = position_dodge(.9)
     ) +
     coord_flip() +
     theme_minimal() +
@@ -1201,11 +1217,15 @@ suppl_inspection_by_supplier <- suppl_inspection %>%
     summarise(avr_inspection_duration = 
                   round(median(as.numeric(inspection_duration)) / 60, 1),
               inspection_qty = n(),
-              deviation_share = round(sum(deviation_lines) / sum(lines), 3),
+              deviation_share = round(sum(deviation_lines) / sum(lines), 2),
               total_lines = sum(lines)) %>% 
     arrange(desc(avr_inspection_duration)) %>% 
     left_join(select(ref_suppliers, supplier_id, supplier_name),
               by = c("supplier" = "supplier_id"))
+
+max_avr_inspection_duration_by_supplier <- max(
+    suppl_inspection_by_supplier$avr_inspection_duration,
+    na.rm = TRUE)
 
 fig_suppl_inspection_by_supplier <- suppl_inspection_by_supplier %>% 
     slice_max(avr_inspection_duration, n = 3) %>% 
@@ -1216,14 +1236,19 @@ fig_suppl_inspection_by_supplier <- suppl_inspection_by_supplier %>%
     geom_text(
         aes(label = round(avr_inspection_duration)),
         size = 6,
-        hjust = 0.9, position = position_dodge(.9)
+        hjust = 0, position = position_dodge(.9)
     ) +
+    ylim(0, max_avr_inspection_duration_by_supplier * 1.35) +
     coord_flip() +
     theme_minimal() +
     labs(x = "", y = "") +
     theme(axis.text.y = element_text(size = 16),
           axis.text.x = element_blank(),
           panel.grid  = element_blank())
+
+max_deviation_share <- max(
+    suppl_inspection_by_supplier$deviation_share,
+    na.rm = TRUE)
 
 fig_suppl_inspection_deviation <- suppl_inspection_by_supplier %>% 
     slice_max(deviation_share, n = 3) %>% 
@@ -1232,10 +1257,11 @@ fig_suppl_inspection_deviation <- suppl_inspection_by_supplier %>%
     geom_bar(stat = "identity", fill = "lightblue") +
     geom_text(
         aes(label = paste0(scales::percent(deviation_share),
-                           "(", total_lines, ")")),
+                           "\n(", total_lines, ")")),
         size = 6,
-        hjust = 1, position = position_dodge(.9)
+        hjust = 0, position = position_dodge(.9)
     ) +
+    ylim(0, max_deviation_share * 2) +
     coord_flip() +
     theme_minimal() +
     labs(x = "", y = "") +
@@ -1254,27 +1280,33 @@ suppl_inspection_by_inspector <- suppl_inspection %>%
 
 
 moving_inspection <- df_inspection %>% 
-    filter(!is.na(nmbr_moving_out)) %>% 
+    filter(!is.na(nmbr_moving_out),
+           as.Date(time_start) >= as.Date("4022-01-01")) %>% 
     group_by(nmbr_inspection, date_inspection) %>% 
     summarise(store = first(store_recipient),
               supplier = first(store_sender),
               inspector = first(user_id),
-              inspection_duration = ifelse(
-                  as.Date(time_start) >= as.Date("4022-01-01"),
-                  last(time_finish) - first(time_start),
-                  0),
+              inspection_duration = last(time_finish) - first(time_start),
               lines = n(),
               total_units = sum(item_qty),
-              deviation_lines = sum(deviation_qty != 0))
+              deviation_lines = sum(deviation_qty != 0)) %>% 
+    ungroup()
 
 avr_moving_inspection_time = round(median(as.numeric(
-    moving_inspection$inspection_duration[moving_inspection$inspection_duration > 0]))/60, 1)
+    moving_inspection$inspection_duration[
+        moving_inspection$inspection_duration > 0])) / 60,
+    2)
 
 moving_inspection_by_store <- moving_inspection %>% 
     group_by(store) %>% 
     summarise(avr_inspection_duration = 
-                  round(median(as.numeric(inspection_duration)) / 60, 1),
+                  round(median(as.numeric(inspection_duration)) / 60, 2),
               inspection_qty = n())
+
+max_avr_inspection_duration_by_store <- max(
+    moving_inspection_by_store$avr_inspection_duration[
+        moving_inspection_by_store$store %in% distribution_stores_name],
+    na.rm = TRUE)
 
 fig_moving_inspection_by_store <- moving_inspection_by_store %>% 
     filter(store %in% distribution_stores_name) %>% 
@@ -1282,10 +1314,11 @@ fig_moving_inspection_by_store <- moving_inspection_by_store %>%
                y = avr_inspection_duration)) +
     geom_bar(stat = "identity", fill = "lightblue") +
     geom_text(
-        aes(label = paste0(avr_inspection_duration, "(", inspection_qty, ")")),
+        aes(label = paste0(avr_inspection_duration, "\n(", inspection_qty, ")")),
         size = 6,
-        hjust = 1, position = position_dodge(.9)
+        hjust = 0, position = position_dodge(.9)
     ) +
+    ylim(0, max_avr_inspection_duration_by_store * 1.25) +
     coord_flip() +
     theme_minimal() +
     labs(x = "", y = "") +
@@ -1302,23 +1335,32 @@ moving_inspection_by_sender <- moving_inspection %>%
               total_lines = sum(lines)) %>% 
     arrange(desc(avr_inspection_duration))
 
+max_avr_inspection_duration_by_sender <- max(
+    moving_inspection_by_sender$avr_inspection_duration,
+    na.rm = TRUE
+)
+
 fig_moving_inspection_by_sender <- moving_inspection_by_sender %>% 
-    slice_max(avr_inspection_duration, n = 3) %>% 
+    slice_max(avr_inspection_duration, n = 3, with_ties = FALSE) %>% 
     ggplot(aes(x = reorder(supplier, avr_inspection_duration,
                            decreasing = TRUE),
                y = avr_inspection_duration)) +
     geom_bar(stat = "identity", fill = "lightblue") +
     geom_text(
-        aes(label = paste0(avr_inspection_duration, "(", inspection_qty, ")")),
+        aes(label = paste0(avr_inspection_duration, "\n(", inspection_qty, ")")),
         size = 6,
-        hjust = 1, position = position_dodge(.9)
+        hjust = 0, position = position_dodge(.9)
     ) +
+    ylim(0, max_avr_inspection_duration_by_sender * 1.25) +
     coord_flip() +
     theme_minimal() +
     labs(x = "", y = "") +
     theme(axis.text.y = element_text(size = 16),
           axis.text.x = element_blank(),
           panel.grid  = element_blank())
+
+max_deviation_share_sender <- max(moving_inspection_by_sender$deviation_share,
+                                  na.rm = TRUE)
 
 fig_moving_inspection_deviation <- moving_inspection_by_sender %>% 
     slice_max(deviation_share, n = 3) %>% 
@@ -1327,10 +1369,11 @@ fig_moving_inspection_deviation <- moving_inspection_by_sender %>%
     geom_bar(stat = "identity", fill = "lightblue") +
     geom_text(
         aes(label = paste0(scales::percent(deviation_share),
-                           "(", total_lines, ")")),
+                           "\n(", total_lines, ")")),
         size = 6,
-        hjust = 1, position = position_dodge(.9)
+        hjust = 0, position = position_dodge(.9)
     ) +
+    ylim(0, max_deviation_share_sender * 1.25) +
     coord_flip() +
     theme_minimal() +
     labs(x = "", y = "") +
@@ -1376,7 +1419,7 @@ fig_customer_assembly_by_store <- customer_assembly_by_store %>%
                y = avr_assembly_duration)) +
     geom_bar(stat = "identity", fill = "lightblue") +
     geom_text(
-        aes(label = paste0(avr_assembly_duration, "(", assembly_qty, ")")),
+        aes(label = paste0(avr_assembly_duration, "\n(", assembly_qty, ")")),
         size = 7,
         hjust = 1, position = position_dodge(.9)
     ) +
@@ -1416,7 +1459,7 @@ fig_moving_assembly_by_store <- moving_assembly_by_store %>%
                y = avr_assembly_duration)) +
     geom_bar(stat = "identity", fill = "lightblue") +
     geom_text(
-        aes(label = paste0(avr_assembly_duration, "(", assembly_qty, ")")),
+        aes(label = paste0(avr_assembly_duration, "\n(", assembly_qty, ")")),
         size = 7,
         hjust = 1, position = position_dodge(.9)
     ) +
@@ -1506,14 +1549,17 @@ moving_assembly_user_data <- assembly_current_month %>%
     rename(doc_nmbr = nmbr_assembly,
            doc_date = date_assembly)
 
+date_start_db <- date_start + years(2000)
+
 stores_worker_data <- bind_rows(supplier_inspection_user_data,
-                              moving_inspection_user_data,
-                              customer_assembly_user_data,
-                              moving_assembly_user_data) %>% 
+                                moving_inspection_user_data,
+                                customer_assembly_user_data,
+                                moving_assembly_user_data) %>% 
     arrange(user_id, time_start) %>% 
-    rowid_to_column() %>% 
     mutate(date_start = as.Date(time_start),
            date_finish = as.Date(time_finish)) %>% 
+    filter(date_start >= date_start_db) %>% 
+    rowid_to_column() %>% 
     group_by(user_id) %>% 
     mutate(next_doc_start = lead(time_start),
            current_doc_finish = time_finish,
@@ -1521,10 +1567,14 @@ stores_worker_data <- bind_rows(supplier_inspection_user_data,
                          1,
                          0)) %>% 
     mutate(next_rowid = map_dbl(time_finish, ~max(rowid[time_start < .]))) %>% 
+    mutate(next_rowid = ifelse(is.infinite(next_rowid),
+                               rowid,
+                               next_rowid)) %>% 
     ungroup() %>% 
     group_by(user_id, date_start) %>% 
     mutate(first_doc_time = hour(min(time_start)),
-           last_doc_time  = hour(max(time_finish[date_start == date_finish]))) %>% 
+           last_doc_time  = hour(max(time_finish[date_start == date_finish]))
+           ) %>% 
     ungroup()
 
 start_doc_time_by_workers <- stores_worker_data %>% 
@@ -1532,7 +1582,8 @@ start_doc_time_by_workers <- stores_worker_data %>%
 
 stores_worker_df <- stores_worker_data %>% 
     mutate(next_time_finish = time_finish[next_rowid],
-           operation_time = ifelse(next_rowid == rowid,
+           operation_time = ifelse(next_rowid == rowid |
+                                       time_finish == time_start,
                                    as.integer(time_finish - time_start),
                                    ifelse(next_rowid == rowid + 1,
                                           ifelse(time_finish < next_time_finish,
@@ -1632,7 +1683,7 @@ fig_store_operations <- store_operations %>%
              position = "fill") +
     scale_y_continuous(breaks = seq(0, 1, .2), 
                        label = scales::percent) +
-    geom_text(aes(label = scales::percent(operation_share)),
+    geom_text(aes(label = scales::percent(operation_share, accuracy = 1)),
               size = 3.5,
               position = position_stack(vjust = 0.5)) +
     scale_fill_brewer(palette = "Pastel1") +
@@ -1936,7 +1987,7 @@ fig_purchase_cond
 Row {data-height=100}
 -----------------------------------------------------------------------
 
-### Коеф-нт використання вантажопідйомності (зважений)
+### Коеф-нт використання вантажопідйомності
 
 ```{r}
 valueBox(
@@ -2202,10 +2253,10 @@ Row {data-height=200}
 fig_suppl_inspection_by_supplier
 ```
 
-### Склади-віправ. з найгіршим середнім часом на приймання, хв.(кіл.док.) {.no-padding}
+### Склади-віправники з найгіршим середнім часом на приймання, хв.(кіл.док.) {.no-padding}
 
 ```{r}
-#fig_moving_inspection_by_sender
+fig_moving_inspection_by_sender
 ```
 
 
@@ -2218,7 +2269,7 @@ Row {data-height=200}
 fig_suppl_inspection_deviation
 ```
 
-### Склади-віправ. з найгіршим % відхілень у поставках (заг.кіл.рядків) {.no-padding}
+### Склади-віправники з найгіршим % відхілень у поставках (заг.кіл.рядків) {.no-padding}
 
 ```{r}
 fig_moving_inspection_deviation

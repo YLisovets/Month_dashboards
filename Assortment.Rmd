@@ -6,7 +6,7 @@ output:
     vertical_layout: scroll
     theme:
       version: 4
-      navbar-bg: "red"
+      primary: "red"
 ---
 
 ```{r setup, include=FALSE}
@@ -1154,7 +1154,7 @@ fig10 <- category_structure_plot_data %>%
           strip.text.x = element_text(size = 5),
           legend.position = "top",
           legend.text.align = 0.3,
-          legend.spacing.x = unit(0.7, 'cm'))
+          legend.spacing.x = unit(0.6, 'cm'))
 
 rm(total_store_shelf_space, items_space_data, cat_store_space, total_sale,
    total_profit, cat_sale_share, cat_space_share, cat_store_share,
@@ -1879,7 +1879,7 @@ fig12 <- category_structure_plot_data %>%
           axis.text.y = element_text(size = 8),
           legend.position = "top",
           legend.text.align = 0.1,
-          legend.spacing.x = unit(0.45, 'cm'))
+          legend.spacing.x = unit(0.3, 'cm'))
 
 rm(sku_inventory_current_month_data, sku_inventory_start_current_month_raw,
    sku_inventory_start_current_month, active_sku_finish_data,
@@ -1939,7 +1939,7 @@ fig17 <- top_suppliers %>%
     geom_bar(stat = "identity", fill = "lightblue") +
     geom_text(
         aes(label = total_sum),
-        size = 4,
+        size = 4.5,
         hjust = 1, position = position_dodge(.9)
     ) +
     coord_flip() +
@@ -1990,7 +1990,7 @@ fig19 <- top_debt_suppliers %>%
     geom_bar(stat = "identity", fill = "lightblue") +
     geom_text(
         aes(label = supplier_sum),
-        size = 4,
+        size = 4.5,
         hjust = 1, position = position_dodge(.9)
     ) +
     coord_flip() +
@@ -2042,7 +2042,7 @@ fig20 <- top_redeemed_goods_suppl %>%
     geom_bar(stat = "identity", fill = "lightblue") +
     geom_text(
         aes(label = sup_redeemed_goods_sum),
-        size = 4,
+        size = 4.5,
         hjust = 1, position = position_dodge(.9)
     ) +
     coord_flip() +
@@ -2101,7 +2101,7 @@ fig18 <- top_suppliers_lead_time %>%
     geom_bar(stat = "identity", fill = "lightblue") +
     geom_text(
         aes(label = avr_lead_time),
-        size = 4,
+        size = 4.5,
         hjust = 1, position = position_dodge(.9)
     ) +
     coord_flip() +
@@ -2338,7 +2338,7 @@ Row {data-height=100}
 
 ```{r}
 valueBox(
-  value = total_shelf_space
+  value = paste0(total_shelf_space, "м3")
 )
 ```
 
@@ -2357,7 +2357,7 @@ valueBox(
 
 Row {data-height=500}
 -----------------------------------------------------
-### Індекс справедливої чстки категорії
+### Індекс справедливої частки категорії
 
 ```{r}
 fig7

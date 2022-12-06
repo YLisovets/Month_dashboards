@@ -6,7 +6,7 @@ output:
     vertical_layout: scroll
     theme:
       version: 4
-      navbar-bg: "red"
+      primary: "red"
 ---
 
 ```{r setup, include=FALSE}
@@ -70,7 +70,8 @@ expenses_fn <- function(date_start, date_finish) {
                   by = c("route_subdiv" = "subdiv_id")) %>% 
         left_join(select(ref_auto, auto_name, subdiv_id),
                   by = c("vehicle_name" = "auto_name")) %>% 
-        left_join(select(ref_subdiv, subdiv_id, vehicle_subdiv_name = subdiv_name))
+        left_join(select(ref_subdiv, subdiv_id,
+                         vehicle_subdiv_name = subdiv_name))
 
     vehicle_khm_service <- delivery_vehicle %>% 
         filter(subdiv_name == "Хмельницький см сервіс") %>% 
@@ -165,31 +166,32 @@ expenses_fn <- function(date_start, date_finish) {
         mutate(expenses_group = case_when(
             cost_item == "05 Податки" &
                 !expItems_name %in% c("Плата за землю",
-                                      "податки")             ~ "Фінансові витрати",
+                                      "податки")          ~ "Фінансові витрати",
             cost_item == "05 Податки" &
                 expItems_name == "податки" &
-                subdiv_name == "Администрация"               ~ "Фінансові витрати",
+                subdiv_name == "Администрация"            ~ "Фінансові витрати",
             cost_item == "05 Податки" &
                 expItems_name %in% c("Плата за землю", "податки") &
                 subdiv_name %in% c("Відділ складської логістики",
-                            "Відділ транспортної логістики") ~ "Логістичні витрати",
-            expItems_name == "ДОСТАВКА ПОКУПЦЮ"              ~ "Витрати на збут",
+                         "Відділ транспортної логістики") ~ "Логістичні витрати",
+            expItems_name == "ДОСТАВКА ПОКУПЦЮ"           ~ "Витрати на збут",
             cost_item %in% c("08 Автовитрати, запчастини",
                              "09 Витрати на пальне",
                              "24 Страхування") &
                 parent_2 %in% c("Регіональні магазини",
-                                "КОРВЕТ")                    ~ "Витрати на збут",
-            parent_2 %in% c("Регіональні магазини", "КОРВЕТ")~ "Витрати на збут",
-            cost_item == "185 Маркетингові витрати"          ~ "Витрати на збут",
-            cost_item == "261 Брак товару"                   ~ "Списання та недост.",
+                                "КОРВЕТ")                 ~ "Витрати на збут",
+            parent_2 %in% c("Регіональні магазини",
+                            "КОРВЕТ")                     ~ "Витрати на збут",
+            cost_item == "185 Маркетингові витрати"       ~ "Витрати на збут",
+            cost_item == "261 Брак товару"                ~ "Списання та недост.",
             cost_item == "27 Втрати ДЗ, Інвентаризації інші" &
                 expItems_name == "Втрати від списання безнадійної заборгованості" ~ "Витрати на збут",
             cost_item == "27 Втрати ДЗ, Інвентаризації інші" &
                 expItems_name != "Втрати від списання безнадійної заборгованості" ~ "Списання та недост.",
             cost_item %in% c("44 Спонсорська/матеріальна допомога",
-                             "43 Капітальні інвестиції")     ~ "Використ.прибутку",
+                             "43 Капітальні інвестиції")  ~ "Використ.прибутку",
             expItems_name == "Штраф за протерміновану кред. заборгованість" ~ "Штраф від постач.",
-            cost_item == "53 Курсові різниці"                ~ "Курсові різниці",
+            cost_item == "53 Курсові різниці"             ~ "Курсові різниці",
             cost_item == "12 Послуги банку" &
                 expItems_name == "Комиссия банка, эквайринг" ~ "Витрати на збут",
             cost_item == "12 Послуги банку" &
@@ -200,37 +202,37 @@ expenses_fn <- function(date_start, date_finish) {
             subdiv_parent %in% c("Регіональні магазини", "КОРВЕТ") |
                 subdiv_name %in% c("Департамент корпоративного продажу",
                                    "Виробничий відділ",
-                                   "Тендерний відділ")       ~ "Витрати на збут",
+                                   "Тендерний відділ")    ~ "Витрати на збут",
             subdiv_parent == "Департамент логістики" |
-                parent_2  == "Департамент логістики"         ~ "Логістичні витрати",
-            TRUE                                             ~ "Адміністр.витрати"),
+                parent_2  == "Департамент логістики"      ~ "Логістичні витрати",
+            TRUE                                          ~ "Адміністр.витрати"),
         
                expenses_subgroup = case_when(
-            cost_item == "00 Заробітна плата"                ~ "Зарплата з податками",
+            cost_item == "00 Заробітна плата"             ~ "Зарплата з податками",
             cost_item == "02 Орендна плата" & 
                 !subdiv_parent %in% "Департамент логістики"  ~ "Утримання торг.площ",
             cost_item == "04 Комунальні послуги" & 
-                parent_2 %in% "Магазини"                     ~ "Утримання торг.площ",
+                parent_2 %in% "Магазини"                  ~ "Утримання торг.площ",
             cost_item == "05 Податки" &
                 expItems_name %in% c("081Податок: Єдиний",
                                      "Відшкодування субсидії ПП",
-                                     "Премии за ПП")         ~ "Утримання ПП",
+                                     "Премии за ПП")      ~ "Утримання ПП",
             cost_item == "05 Податки" &
                 expItems_name %in% c("Плата за землю", "податки") &
-                parent_2 %in% "Магазини"                     ~ "Утримання торг.площ",
+                parent_2 %in% "Магазини"                  ~ "Утримання торг.площ",
             cost_item %in% c("08 Автовитрати, запчастини",
                              "09 Витрати на пальне") &
-                parent_2 %in% "Департамент логістики"        ~ "Витрати на авто",
+                parent_2 %in% "Департамент логістики"     ~ "Витрати на авто",
             cost_item %in% c("08 Автовитрати, запчастини",
                              "09 Витрати на пальне",
                              "24 Страхування") &
-                !is.na(vehicle_subdiv_service)               ~ "Витрати на доставку покупцям",
-            expItems_name == "ДОСТАВКА ПОКУПЦЮ"              ~ "Витрати на доставку покупцям",
-            cost_item == "185 Маркетингові витрати"          ~ "Маркетингові витрати",
+                !is.na(vehicle_subdiv_service)            ~ "Витрати на доставку покупцям",
+            expItems_name == "ДОСТАВКА ПОКУПЦЮ"           ~ "Витрати на доставку покупцям",
+            cost_item == "185 Маркетингові витрати"       ~ "Маркетингові витрати",
             cost_item == "44 Спонсорська/матеріальна допомога" ~ "Спонсорська допомога",
-            cost_item == "43 Капітальні інвестиції"            ~ "Капітальні інвестиції",
+            cost_item == "43 Капітальні інвестиції"       ~ "Капітальні інвестиції",
             cost_item == "29 Податок на прибуток від осн. діяльності" ~ "Податок на прибуток",
-            TRUE                                               ~ "Інші")
+            TRUE                                          ~ "Інші")
         ) %>% 
         add_row(expenses_group = "Фінансові витрати",
                 expenses_subgroup = "ПДВ",
@@ -280,14 +282,14 @@ sale_fn <- function(date_start, date_finish) {
     
     cost_df <- cost_data(date_start,
                          date_finish) %>% 
-        mutate(project = ifelse(project %in% c("Новый клиент",
-                                               "Сервис",
-                                               "Тендер Сервіс ",
-                                               "Сервіс ГОТІВКА"),
-                                "Сервис",
-                                ifelse(is.na(project) | project == "Сотрудники",
-                                       "Розница",
-                                       project))) %>% 
+        left_join(select(ref_projects, project_id, parent_project_id),
+                  by = "project_id") %>% 
+        mutate(project = case_when(
+            parent_project_id == "000000009" ~ "Сервис",
+            !is.na(nmbr_check_doc)           ~ "Розница",
+            project_id %in% c("000000003",
+                              "000000002")   ~ "Розница",
+            TRUE                             ~ "Прочее")) %>% 
         group_by(subdiv_name, project) %>% 
         summarise(cost_sum = sum(item_sum, na.rm = TRUE) +
                              sum(item_vat, na.rm = TRUE)) %>% 
@@ -305,22 +307,25 @@ sale_fn <- function(date_start, date_finish) {
 
     sale_df <- sale_data_total(date_start,
                                date_finish) %>% 
+        left_join(select(ref_projects, project_id, parent_project_id),
+                  by = "project_id") %>%
         left_join(select(ref_items, item_id, item_name, parent_itemId)) %>% 
-        mutate(project = ifelse(project %in% c("Новый клиент",
-                                               "Сервис",
-                                               "Тендер Сервіс ",
-                                               "Сервіс ГОТІВКА",
-                                               "Интернет-магазин Серв"),
-                                "Сервис",
-                                ifelse(parent_itemId == "000000185",
-                                       ifelse(str_detect(item_name,
-                                                         "(Відшкодування)|(Орендна плата)") &
-                                                  item_name != "Відшкодування по інвентаризації",
-                                              "Оренда",
-                                              item_name),
-                                       ifelse(project == "Сотрудники",
-                                              "Розница",
-                                              project))),
+        mutate(project = ifelse(
+            parent_project_id == "000000009",
+            "Сервис",
+            ifelse(parent_itemId == "000000185",
+                   ifelse(
+                       str_detect(item_name,
+                                  "(Відшкодування)|(Орендна плата)") &
+                           !item_name %in% c(
+                               "Відшкодування по інвентаризації",
+                               "Відшкодування  вартості доставки товару"),
+                       "Оренда",
+                       item_name),
+                    ifelse(project == "Сотрудники" | 
+                               parent_project_id == "000000010",
+                           "Розница",
+                           project))),
                organiz_id = ifelse(organiz_id == "000000001",
                                    "korvet",
                                    "other")) %>% 
@@ -534,8 +539,12 @@ subdiv_vat_calculation <- function(data, total_vat) {
            !(subdiv_name %in% c("Администрация", "Відділ складської логістики") &
                  project == "Розница"),
            subdiv_name != "Бухгалтерия") %>% 
-    mutate(across(where(is.numeric), ~ifelse(is.na(.), 0, .)),
-           gross_profit = sale_sum - cost_sum,
+    mutate(across(where(is.numeric), ~ifelse(is.na(.), 0, .))) %>% 
+    group_by(subdiv_name) %>% 
+    summarise(sale_sum = sum(sale_sum),
+              cost_sum = sum(cost_sum)) %>% 
+    ungroup() %>%     
+    mutate(gross_profit = sale_sum - cost_sum,
            vat_share = round(gross_profit / sum(gross_profit) * total_vat)) %>% 
     select(subdiv_name, vat_share)
     
@@ -1102,7 +1111,10 @@ cash_flow_tbl <- cash_flow_df %>%
                                 0,
                                 sponsored_cur_month),
             .after = 7) %>% 
-    filter(sum_moving != 0) %>% 
+    filter(!(item %in% c("Поповнення обігових коштів",
+                       "Виплата дівідендів",
+                       "Спонсорська допомога") &
+               sum_moving == 0)) %>% 
     mutate(sum_moving = round(sum_moving / 1000, 1))
 
 cash_flow_nrow <- nrow(cash_flow_tbl)
@@ -1784,12 +1796,12 @@ expenses_vis %>%
          fill = "",
          x = "",
          title = "") +
-    theme(legend.text = element_text(size = 9),
+    theme(legend.text = element_text(size = 8),
           axis.text.x = element_text(size = 9),
           axis.text.y = element_text(size = 9),
           legend.position = "top",
-          legend.text.align = 0.5,
-          legend.spacing.x = unit(1.0, 'cm'))
+          legend.text.align = 0.3,
+          legend.spacing.x = unit(0.4, 'cm'))
 ```
 
 Row {data-height=650}
@@ -2051,7 +2063,7 @@ subdiv_profit_month %>%
                                  format = colFormat(separators = TRUE,
                                                     digits = 1)),
             profitability = colDef(name = "Рент.",
-                                   minWidth = 50,
+                                   minWidth = 45,
                                    aggregate = JS("function(values, rows) {
                                     let totalProfit = 0
                                     let totalSale = 0
@@ -2135,8 +2147,8 @@ subdiv_profit_year %>%
                                   minWidth = 60,
                                   format = colFormat(separators = TRUE,
                                                       digits = 1)),
-            profitability = colDef(name = "Рентаб.",
-                                   minWidth = 50,
+            profitability = colDef(name = "Рент.",
+                                   minWidth = 45,
                                    aggregate = JS("function(values, rows) {
                                     let totalProfit = 0
                                     let totalSale = 0
