@@ -1,0 +1,1376 @@
+---
+title: "Звіт з В2B (Супермаркети) за `r lubridate::quarter(lubridate::rollback(Sys.Date()))` квартал `r lubridate::year(lubridate::rollback(Sys.Date()))`р."
+output: 
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      out.width = '100%')
+library(tidyverse)
+library(timetk)
+library(reactablefmtr)
+
+library(DBI)
+library(odbc)
+library(dbplyr)
+```
+
+```{r preparation}
+source("global.R", local = FALSE)
+
+con <- connect_to_db()
+
+get_references()
+
+date_start <- rollback(Sys.Date(), roll_to_first = TRUE) - months(3)
+date_finish <- date_start + months(3)
+report_quarter <- quarter(date_start)
+
+report_subdivs <- ref_subdiv_category %>% 
+    filter(subdiv_category == " Супермаркети  В2В" |
+               subdiv_name == "Чернівці") %>% 
+    left_join(ref_subdiv, by = "subdiv_name") %>% 
+    filter(subdiv_parent != "яя_Закрытые") %>% 
+    pull(subdiv_name)
+
+colors <- c("#DA4511", "#FFBD00", "#6A953F", "#9A6233", "#D3AE7C", "#59BEC4",
+            "#307CA1")
+```
+
+```{r main_indicators}
+sale_plan_cust_data <- sale_plan_data_full(date_start + years(2000),
+                                      date_finish + years(2000)) %>% 
+    filter(script_name %in% c("План на клиента (корпоратив)",
+                              "План на клиента (бюджет)")) %>% 
+    mutate(subdiv_name = ifelse(subdiv_name == "Луцьк Ковельськ",
+                                "Луцьк см сервіс",
+                                subdiv_name))
+
+sale_plan_last_month <- sale_plan_cust_data %>%
+    filter(date_saleplan_doc == max(date_saleplan_doc)) %>% 
+    group_by(subdiv_name) %>% 
+    summarise(plan_customers = n_distinct(customer_name),
+              plan_sum = sum(sum)) %>% 
+    filter(subdiv_name %in% report_subdivs)
+
+sale_plan_cust <- sale_plan_cust_data %>%
+    group_by(subdiv_name) %>% 
+    summarise(plan_customers = n_distinct(customer_name),
+              plan_sum = sum(sum)) %>% 
+    filter(subdiv_name %in% report_subdivs)
+
+
+sale_data <- sale_data_global(floor_date(date_start + years(2000) - years(1),
+                                    unit = "year"),
+                              date_finish + years(2000)) %>%
+    left_join(select(ref_projects, project_name, parent_project),
+              by = c("project" = "project_name")) %>% 
+    filter(parent_project %in% "Сервис итого",
+           !subdiv_name %in% c("Бухгалтерия", "Відділ складської логістики")
+           ) %>%
+    mutate(subdiv_name = str_replace(subdiv_name, "роздріб", "сервіс"),
+           subdiv_name = str_replace(subdiv_name, "Роздріб", "Сервіс"),
+           subdiv_name = ifelse(subdiv_name == "Луцьк Ковельськ",
+                                "Луцьк см сервіс",
+                                subdiv_name),
+           date_sale_doc = as.Date(date_sale_doc) - years(2000),
+           date_cust_order_doc = as.Date(date_cust_order_doc) - years(2000)) %>% 
+    filter(subdiv_name %in% report_subdivs)
+
+retail_customers <- data.frame(customer_id = unique(sale_data$customer_id)) %>%
+    left_join(ref_customers) %>% 
+    filter(is.na(customer_type) & edrp_code == "") %>% 
+    pull(customer_id)
+
+returns_data <- refund_data(floor_date(date_start + years(2000) - years(1),
+                                    unit = "year"),
+                            today() + years(2000)) %>%
+    mutate(date_refund_doc = as.Date(date_refund_doc) - years(2000),
+           date_sale_doc = as.Date(date_sale_doc) - years(2000)) %>%
+    left_join(select(ref_projects, project_name, parent_project),
+              by = c("project" = "project_name")) %>% 
+    filter(date_sale_doc >= floor_date(date_start - years(1),
+                                       unit = "year"),
+           date_sale_doc < date_finish,
+           parent_project %in% "Сервис итого") 
+
+returns_data_full <- returns_data %>% 
+    group_by(nmbr_sale_doc, date_sale_doc) %>%
+    summarise(sum_refund = sum(item_sum))
+
+    
+sale_total <- sale_data %>% 
+    
+    # Добавляем возвраты
+    left_join(returns_data_full) %>% 
+    replace_na(list(sum_refund = 0)) %>% 
+    mutate(doc_sum = doc_sum - sum_refund) %>%
+    
+    # Удаляем документы, по которым возвраты на ту же сумму
+    filter(doc_sum > 0) %>% 
+    
+    # Удаляем конечных покупателей
+    filter(!customer_id %in% retail_customers)
+
+
+sale_full_data <- sale_data_full(date_start + years(2000),
+                                 date_finish + years(2000)) %>%
+    left_join(select(ref_projects, project_name, parent_project),
+              by = c("project" = "project_name")) %>% 
+    filter(parent_project %in% "Сервис итого",
+           !subdiv_name %in% c("Бухгалтерия", "Відділ складської логістики")
+           )
+
+returns_quarter_data <- returns_data %>% 
+    filter(date_refund_doc >= date_start,
+           date_refund_doc <  date_finish,
+           !subdiv_name %in% c("Бухгалтерия", "Відділ складської логістики")) %>% 
+    mutate(item_qty = item_qty * (-1),
+           item_sum = item_sum * (-1)) %>% 
+    select(-c(nmbr_refund_doc, date_refund_doc))
+
+sale_quarter_data_raw <- sale_full_data %>% 
+    # mutate(date_sale_doc = as.Date(date_sale_doc) - years(2000)) %>%
+    select(-item_auto_discount) %>% 
+    bind_rows(returns_quarter_data) %>% 
+    mutate(subdiv_name = ifelse(subdiv_name == "Луцьк Ковельськ",
+                                "Луцьк см сервіс",
+                                subdiv_name)) %>% 
+    filter(subdiv_name %in% report_subdivs)
+
+sale_quarter_data <- sale_quarter_data_raw %>% 
+    mutate(date_sale_doc = as.Date(date_sale_doc) - years(2000)) %>%
+    group_by(subdiv_name, customer_id, item_id) %>% 
+    summarise(cust_item_sum   = sum(item_sum, na.rm = TRUE),
+              cust_item_units = sum(item_qty, na.rm = TRUE)) %>% 
+    ungroup()
+
+
+sale_quarter_category_raw <- sale_quarter_data %>% 
+    left_join(select(ref_items, item_id, group_id)) %>% 
+    left_join(select(ref_item_group, group_id, category_name)) %>%
+    filter(!is.na(category_name)) %>% 
+    group_by(subdiv_name, customer_id, category_name) %>% 
+    summarise(cust_cat_sum = sum(cust_item_sum)) %>% 
+    ungroup()
+
+
+sale_quarter_category <- sale_quarter_category_raw %>% 
+    group_by(subdiv_name, customer_id) %>% 
+    summarise(cust_categories = sum(cust_cat_sum > 0)) %>% 
+    ungroup()
+
+sale_quarter_docs <- sale_quarter_data_raw %>% 
+    group_by(subdiv_name, nmbr_sale_doc, date_sale_doc) %>% 
+    summarise(doc_sum = sum(item_sum)) %>% 
+    ungroup() %>% 
+    filter(doc_sum > 0) %>% 
+    count(subdiv_name, name = "subdiv_sale_docs")
+
+sale_df_raw <- sale_quarter_data %>%     
+    group_by(subdiv_name, customer_id) %>% 
+    summarise(cust_sum   = sum(cust_item_sum),
+              cust_units = sum(cust_item_units),
+              cust_items = sum(cust_item_units > 0)) %>% 
+    ungroup() %>% 
+    filter(!near(cust_sum, 0)) %>% 
+    left_join(sale_quarter_category) %>%
+
+    group_by(subdiv_name) %>% 
+    summarise(subdiv_sum = sum(cust_sum, na.rm = TRUE),
+              subdiv_customers = sum(cust_sum > 0, na.rm = TRUE),
+              subdiv_units = sum(cust_units, na.rm = TRUE),
+              avr_cust_items = round(mean(cust_items[cust_sum > 0],
+                                          na.rm = TRUE), 1),
+              avr_cust_categories = round(mean(
+                  cust_categories[cust_categories > 0], na.rm = TRUE), 1)) %>% 
+    left_join(sale_quarter_docs) %>%
+    mutate(avr_trans_sum      = round(subdiv_sum / subdiv_sale_docs),
+           avr_cust_trans_qty = round(subdiv_sale_docs / subdiv_customers, 3)) %>% 
+    ungroup() %>% 
+    filter(subdiv_units > 0)
+
+
+paper_sales <- sale_quarter_category_raw %>%
+    filter(category_name == "01. Папір офісний") %>%
+    group_by(subdiv_name) %>%
+    summarise(paper_sales = sum(cust_cat_sum))
+
+sale_prev_year_raw <- sale_total %>% 
+    filter(date_sale_doc >= (date_start - years(1)),
+           date_sale_doc <  (date_finish - years(1)))
+
+sale_prev_year <- sale_prev_year_raw %>% 
+    group_by(subdiv_name) %>% 
+    summarise(sales_prev_year = sum(doc_sum),
+              cust_prev_year = length(unique(customer_id)),
+              total_trans = n(),
+              avr_trans_sum_prev = round(sales_prev_year / total_trans),
+              avr_cust_trans_qty_prev = round(total_trans / cust_prev_year, 3)) %>% 
+    ungroup() %>% 
+    select(-total_trans)
+
+
+cost_data <- cost_data(date_start + years(2000),
+                       date_finish + years(2000)) %>% 
+    left_join(select(ref_projects, project_name, parent_project),
+              by = c("project" = "project_name")) %>% 
+    filter(!is.na(nmbr_sale_doc) | !is.na(nmbr_refund_doc),
+           parent_project %in% "Сервис итого",
+           !subdiv_name %in% c("Бухгалтерия", "Відділ складської логістики"))
+
+cost_df <- cost_data %>% 
+    mutate(subdiv_name = str_replace(subdiv_name, "роздріб", "сервіс"),
+           subdiv_name = ifelse(subdiv_name == "Луцьк Ковельськ",
+                                "Луцьк см сервіс",
+                                subdiv_name)) %>% 
+    filter(subdiv_name %in% report_subdivs) %>% 
+    group_by(subdiv_name) %>% 
+    summarise(total_cost = sum(item_sum) + sum(item_vat))
+
+
+debt_customer_start <- partner_debt_data(date_start + years(2000)) %>%
+    left_join(select(ref_contract, contract_id, contract_name)) %>%
+    filter(type_contract == "customer",
+           !str_detect(contract_name, "^685"))
+
+receivable_cust_start <- debt_customer_start %>% 
+    left_join(select(ref_customers, customer_id, customer_folder),
+              by = c("partner_id" = "customer_id")) %>% 
+    filter(!customer_folder %in% c("КІНЦЕВИЙ ПОКУПЕЦЬ", "РЕГИОНАЛЬНЫЕ МАГАЗИНЫ",
+                                  "СПЕЦИАЛИСТЫ"),
+           balance > 1)
+
+cust_unpaid_docs_start_data <- customer_debt_docs(date_start + years(2000)) %>%
+    mutate(date_sale_doc = as.Date(date_sale_doc) - years(2000)) %>%
+    filter(contract_id %in% unique(receivable_cust_start$contract_id)) %>% 
+    left_join(select(receivable_cust_start, contract_id, balance)) %>% 
+    arrange(contract_id, desc(date_sale_doc), desc(doc_moving_sum)) %>% 
+    group_by(contract_id) %>%
+    mutate(contract_docs_sum = sum(doc_moving_sum),
+           diff = balance - contract_docs_sum)
+
+cust_unpaid_docs_start_good <- cust_unpaid_docs_start_data %>% 
+    filter(near(diff, 0))
+
+cust_unpaid_docs_start_wrong <- cust_unpaid_docs_start_data %>% 
+    filter(!near(diff, 0)) %>% 
+    mutate(cum_sum = cumsum(doc_moving_sum),
+           diff_cum = balance - cum_sum,
+           qty_negativ = sum(diff_cum < 0),
+           doc_rank = min_rank(diff_cum)) %>% 
+    # Удаляем все более поздние документы продажи, превышающие сумму ДЗ 
+    filter(!(diff < -1 & diff_cum < 0 & doc_rank < qty_negativ)) %>% 
+    # Обновляем данные
+    mutate(sum_docs = sum(doc_moving_sum),
+           diff = balance - sum_docs) %>% 
+    
+    # Уменьшаем самую раннюю накладную на разницу между суммой накладных и ДЗ
+    mutate(doc_moving_sum = ifelse((!near(diff, 0) & diff < 0 &
+                                      doc_rank == qty_negativ) |
+                                      (!near(diff, 0) & diff > 0 &
+                                           doc_rank == 1),
+                                   doc_moving_sum + diff,
+                                   doc_moving_sum))
+
+debt_start_df <- bind_rows(cust_unpaid_docs_start_good,
+                                       cust_unpaid_docs_start_wrong) %>% 
+    mutate(subdiv_name = ifelse(subdiv_name == "Луцьк Ковельськ",
+                                "Луцьк см сервіс",
+                                subdiv_name)) %>%
+    filter(subdiv_name %in% report_subdivs) %>% 
+    group_by(subdiv_name) %>% 
+    summarise(total_debt_start = sum(doc_moving_sum))
+
+
+debt_customer_finish <- partner_debt_data(date_finish + years(2000)) %>%
+    left_join(select(ref_contract, contract_id, contract_name,
+                     contract_arrears_day)) %>%
+    filter(type_contract == "customer",
+           !str_detect(contract_name, "^685"))
+
+receivable_cust_finish <- debt_customer_finish %>% 
+    left_join(select(ref_customers, customer_id, customer_folder),
+              by = c("partner_id" = "customer_id")) %>% 
+    filter(!customer_folder %in% c("КІНЦЕВИЙ ПОКУПЕЦЬ", "РЕГИОНАЛЬНЫЕ МАГАЗИНЫ",
+                                  "СПЕЦИАЛИСТЫ"),
+           balance > 1)
+
+cust_unpaid_docs_finish_data <- customer_debt_docs(date_finish + years(2000)) %>%
+    mutate(date_sale_doc = as.Date(date_sale_doc) - years(2000)) %>%
+    filter(contract_id %in% unique(receivable_cust_finish$contract_id)) %>% 
+    left_join(select(receivable_cust_finish, contract_id, balance)) %>% 
+    arrange(contract_id, desc(date_sale_doc), desc(doc_moving_sum)) %>% 
+    group_by(contract_id) %>%
+    mutate(contract_docs_sum = sum(doc_moving_sum),
+           diff = balance - contract_docs_sum)
+
+cust_unpaid_docs_finish_good <- cust_unpaid_docs_finish_data %>% 
+    filter(near(diff, 0))
+
+cust_unpaid_docs_finish_wrong <- cust_unpaid_docs_finish_data %>% 
+    filter(!near(diff, 0)) %>% 
+    mutate(cum_sum = cumsum(doc_moving_sum),
+           diff_cum = balance - cum_sum,
+           qty_negativ = sum(diff_cum < 0),
+           doc_rank = min_rank(diff_cum)) %>% 
+    # Удаляем все более поздние документы продажи, превышающие сумму ДЗ 
+    filter(!(diff < -1 & diff_cum < 0 & doc_rank < qty_negativ)) %>% 
+    # Обновляем данные
+    mutate(sum_docs = sum(doc_moving_sum),
+           diff = balance - sum_docs) %>% 
+    
+    # Уменьшаем самую раннюю накладную на разницу между суммой накладных и ДЗ
+    mutate(doc_moving_sum = ifelse((!near(diff, 0) & diff < 0 &
+                                      doc_rank == qty_negativ) |
+                                      (!near(diff, 0) & diff > 0 &
+                                           doc_rank == 1),
+                                   doc_moving_sum + diff,
+                                   doc_moving_sum))
+
+cust_unpaid_docs_finish_df <- bind_rows(cust_unpaid_docs_finish_good,
+                                       cust_unpaid_docs_finish_wrong) %>% 
+    mutate(subdiv_name = ifelse(subdiv_name == "Луцьк Ковельськ",
+                                "Луцьк см сервіс",
+                                subdiv_name)) %>% 
+    filter(subdiv_name %in% report_subdivs)
+
+debt_finish_df <- cust_unpaid_docs_finish_df %>% 
+    group_by(subdiv_name) %>% 
+    summarise(total_debt_finish = sum(doc_moving_sum))
+
+
+df_delivery <- delivery_data(date_start  + years(2000),
+                             date_finish + years(2000)) %>% 
+    filter(!is.na(nmbr_deliv_order),
+           !direction %in% c("Багажка", "Закриття документів", "САМОВИВІЗ"),
+           to_intermediate == FALSE,
+           is_not_delivered == FALSE) %>% 
+    mutate(date_delivery = as.Date(date_delivery) - years(2000)) %>% 
+    select(nmbr_delivery, date_delivery, nmbr_deliv_order, date_deliv_order,
+           store_name) %>% 
+    distinct(nmbr_deliv_order, date_deliv_order, .keep_all = TRUE)
+
+df_delivery_order <- delivery_order_data(date_start  + years(2000) - months(2),
+                                         date_finish + years(2000)) %>% 
+    filter(!is.na(nmbr_sale_doc)) %>% 
+    select(nmbr_deliv_order, date_deliv_order, nmbr_sale_doc, date_sale_doc)
+
+delivery_data <- df_delivery %>% 
+    left_join(df_delivery_order) %>% 
+    filter(!is.na(nmbr_sale_doc)) %>% 
+    mutate(date_sale_doc = as.Date(date_sale_doc) - years(2000)) %>% 
+    left_join(select(sale_total, nmbr_sale_doc, date_sale_doc,
+                     date_cust_order_doc, subdiv_name)) %>% 
+    filter(!is.na(date_cust_order_doc)) %>% 
+    mutate(lead_time = as.integer(date_delivery - date_cust_order_doc))
+
+
+subdiv_lead_time <- delivery_data %>% 
+    mutate(subdiv_name = ifelse(subdiv_name == "Луцьк Ковельськ",
+                                "Луцьк см сервіс",
+                                subdiv_name)) %>% 
+    filter(subdiv_name %in% report_subdivs) %>% 
+    group_by(subdiv_name) %>% 
+    summarise(avr_lead_time = round(mean(lead_time), 1))
+
+empl_data <- work_time_data(date_start + years(2000),
+                                      date_finish + years(2000)) %>% 
+    filter(
+           position_id %in% c("000000195",
+                              "000000176",
+                              "000000200",
+                              "000000262",
+                              "000000026",
+                              "000000025",
+                              "000000283",
+                              "000000031"),
+           working_days > 7) %>% 
+    mutate(subdiv_name = ifelse(subdiv_name == "Луцьк Ковельськ",
+                                "Луцьк см сервіс",
+                                subdiv_name)) %>% 
+    filter(subdiv_name %in% report_subdivs) %>% 
+    group_by(date, subdiv_name) %>% 
+    summarise(empl = n()) %>% 
+    mutate(empl = case_when(
+                  subdiv_name == "Тернопіль см сервіс"        ~ empl - 0.5,
+                  subdiv_name == "Івано-Франківськ см сервіс" ~ empl + 0.5,
+                  TRUE                                        ~ as.numeric(empl)
+    )) %>% 
+    group_by(subdiv_name) %>% 
+    summarise(empl = round(mean(empl), 2))
+
+
+sale_df <- sale_df_raw %>% 
+    full_join(sale_plan_cust %>% 
+                  filter(subdiv_name %in% report_subdivs)) %>% 
+    full_join(sale_prev_year %>% 
+                  filter(subdiv_name %in% report_subdivs)) %>%
+    full_join(debt_start_df %>% 
+                  filter(subdiv_name %in% report_subdivs)) %>% 
+    full_join(debt_finish_df %>% 
+                  filter(subdiv_name %in% report_subdivs)) %>% 
+    full_join(paper_sales %>% 
+                  filter(subdiv_name %in% report_subdivs)) %>%
+    full_join(cost_df %>% 
+                  filter(subdiv_name %in% report_subdivs)) %>% 
+    # left_join(ref_subdiv_category) %>%
+    # left_join(subdiv_lead_time) %>% 
+    left_join(empl_data) %>% 
+    # mutate(across(where(is.numeric), ~ifelse(is.na(.), 0, .)),
+    #        subdiv_category = ifelse(!is.na(subdiv_category),
+    #                                  subdiv_category,
+    #                                 "Інші")) %>% 
+    mutate(
+           # avr_unit_sum = ifelse(subdiv_units == 0,
+           #                       0,
+           #                       round(subdiv_sum / subdiv_units, 1)),
+           avr_cust_sum = ifelse(subdiv_customers == 0,
+                                 0,
+                                 round(subdiv_sum / subdiv_customers)),
+           avr_cust_sum_implement = ifelse(plan_customers == 0,
+                                     0,
+                                     round(avr_cust_sum / (plan_sum /
+                                                           plan_customers),
+                                           3)),
+           plan_sum_implement = ifelse(plan_sum == 0,
+                                   0,
+                                   round(subdiv_sum / plan_sum, 3)),
+           sales_growth = ifelse(sales_prev_year == 0,
+                                 0,
+                                 round(subdiv_sum / sales_prev_year, 2)),
+           customers_change = ifelse(cust_prev_year == 0,
+                                     0,
+                                     round(subdiv_customers / cust_prev_year- 1,
+                                           3)),
+           plan_cust_implement = ifelse(plan_customers == 0,
+                                   0,
+                                   round(subdiv_customers / plan_customers, 3)),
+           receivables = round(as.integer(date_finish - date_start) /
+                                   (subdiv_sum /
+                                   ((total_debt_start + total_debt_finish) / 2)),
+                               1),
+           paper_share = ifelse(subdiv_sum == 0,
+                                "-",
+                                round(paper_sales / subdiv_sum, 3)),
+           gross_profit = subdiv_sum - total_cost,
+           profitability = round(gross_profit / subdiv_sum, 3),
+           gmrol = ifelse(empl > 0,
+                          round(gross_profit / empl / 1000, 1),
+                          "-"),
+           servis_factor = ifelse(empl > 0,
+                          round(subdiv_customers / empl),
+                          "-")
+           )
+
+dbDisconnect(con)
+```
+
+
+### Щомісячні продажі за підрозділами за останні 2 роки(млн.грн) з виконанням плану за `r month(date_finish - months(1), label = TRUE, abbr = FALSE)`
+
+```{r}
+sale_plot_data <- sale_total %>% 
+    group_by(subdiv_name) %>% 
+    summarise_by_time(date_sale_doc, .by = "month", sales = sum(doc_sum)) %>% 
+    ungroup()
+
+labels_data <- sale_plot_data %>%
+    filter(date_sale_doc == max(date_sale_doc)) %>% 
+    left_join(select(sale_plan_last_month, subdiv_name, plan_sum),
+              by = "subdiv_name") %>% 
+    mutate(subdiv_name = factor(subdiv_name,
+                                labels = c("Ів.-Франк.", "Кам-Поділ.", "Луцьк",
+                                           "Рівне", "Тернопіль", "Хмельницький",
+                                           "Чернівці"))) %>%
+    mutate(plan_impl = paste0(round(sales / plan_sum *100), "%"))
+
+sale_plot_data %>% 
+    mutate(subdiv_name = factor(subdiv_name,
+                                labels = c("Ів.-Франк.", "Кам-Поділ.", "Луцьк",
+                                           "Рівне", "Тернопіль", "Хмельницький",
+                                           "Чернівці"))) %>%
+    ggplot(aes(x = date_sale_doc, y = sales/1000000, color = subdiv_name)) +
+    geom_line(size = 1.3) +
+    scale_color_manual(values = colors) +
+    scale_x_date(date_breaks = '2 months', 
+                 date_labels = "%b-%y") +
+    ggrepel::geom_label_repel(data = labels_data , aes(x = date_sale_doc,
+                                                       y = sales/1000000,
+                                                       label = plan_impl,
+                                                       color = subdiv_name),
+                              size = 3, label.padding = 0.15, nudge_x = 0.25,
+                              show.legend = FALSE) +
+    theme_minimal() +
+    labs(x = '', y = 'Продажі, млн.грн', color = 'Підрозділ') +
+    theme(axis.text.x = element_text(angle = 45))
+```
+
+
+### Основні показники за `r report_quarter` квартал `r year(date_start)`р.
+
+```{r}
+sale_df %>% 
+    select(subdiv_name, subdiv_sum, plan_sum_implement,
+           sales_growth, total_debt_finish, receivables,
+           gross_profit, profitability) %>% 
+    reactable(striped = TRUE,
+        columns = list(
+            subdiv_name = colDef(name = "Підрозділ"),
+            subdiv_sum  = colDef(name = "Продаж",
+                                 minWidth = 60,
+                                 format = colFormat(separators = TRUE,
+                                                    digits = 0)),
+            plan_sum_implement = colDef(name = "Викон.плану",
+                                    minWidth = 70,
+                                    style = function(value) {
+                                        if (value < 0.8) {
+                                            color <- "#e00000"
+                                        } else if (value < 0.95) {
+                                            color <- "#e67f83" 
+                                        } else {
+                                            color <- "#008000"
+                                        }
+                                        list(color = color)
+                                    },
+                                    format = colFormat(percent = TRUE)),
+            sales_growth = colDef(name = "ТР",
+                                  minWidth = 50, 
+                                  style = function(value) {
+                                      if (value < 1) {
+                                          color <- "#e00000"
+                                      } else {
+                                           color <- "#008000"
+                                      }
+                                      list(color = color)
+                                   },
+                                   format = colFormat(digits = 2)),
+            total_debt_finish = colDef(name = "Сума ДЗ",
+                                       minWidth = 60,
+                                       format = colFormat(separators = TRUE,
+                                                   digits = 0)),
+            receivables = colDef(name = "Період обороту",
+                                 minWidth = 60,
+                                 style = function(value) {
+                                   if (value > 10) {
+                                            color <- "#e00000"
+                                        } else {
+                                            color <- "#008000"
+                                        }
+                                    list(color = color)
+                                    },
+                                 format = colFormat(digits = 1)),
+            gross_profit = colDef(name = "Вал.приб.",
+                                  minWidth = 60,
+                                  format = colFormat(separators = TRUE,
+                                                     digits = 0)),
+            profitability = colDef(name = "Рентаб.",
+                                   minWidth = 50,
+                                   format = colFormat(percent = TRUE,
+                                                      digits = 1))
+                ),
+        bordered = TRUE
+    )
+```
+
+
+### Факторний аналіз продаж
+
+Продажі можна розложити на наступні фактори:  
+
+**Кількість покупців * Сер.кількість накладних покупця * Сер.сума накладних**
+
+Проведемо факторний аналіз змін за рік продаж по кожному підрозділу:
+
+```{r}
+factor_analysis <- sale_df %>% 
+    select(subdiv_name, subdiv_customers, cust_prev_year,
+           avr_trans_sum, avr_trans_sum_prev, 
+           avr_cust_trans_qty, avr_cust_trans_qty_prev,
+           subdiv_sum, sales_prev_year) %>% 
+    mutate(diff_cust_qty = subdiv_customers - cust_prev_year,
+           influence_cust_qty = round(diff_cust_qty * avr_trans_sum_prev * 
+               avr_cust_trans_qty_prev),
+           diff_avr_trans_sum = avr_trans_sum - avr_trans_sum_prev,
+           influence_trans_sum = round(diff_avr_trans_sum * subdiv_customers  * 
+               avr_cust_trans_qty_prev),
+           diff_avr_cust_trans_qty = avr_cust_trans_qty -avr_cust_trans_qty_prev,
+           influence_cust_trans_qty = round(diff_avr_cust_trans_qty *
+                                              subdiv_customers * avr_trans_sum),
+           diff_sales = subdiv_sum - sales_prev_year) %>% 
+    select(subdiv_name, diff_cust_qty, influence_cust_qty,
+           diff_avr_trans_sum, influence_trans_sum,
+           diff_avr_cust_trans_qty, influence_cust_trans_qty,
+           diff_sales) %>% 
+    mutate(subdiv_name = factor(subdiv_name,
+                                labels = c("Ів.-Франк.", "Кам-Поділ.", "Луцьк",
+                                           "Рівне", "Тернопіль", "Хмельницький",
+                                           "Чернівці")))
+
+factor_analysis %>% 
+    reactable(striped = TRUE,
+        columns = list(
+            subdiv_name   = colDef(name = "Підрозділ"),
+            diff_cust_qty = colDef(name = "Зміна",
+                                 minWidth = 50,
+                                 style = function(value) {
+                                       if (value < 0) {
+                                           color <- "#e00000"
+                                        } else {
+                                           color <- "#008000"
+                                        }
+                                    list(color = color)
+                                    },
+                                 format = colFormat(separators = TRUE,
+                                                    digits = 0)),
+            influence_cust_qty = colDef(name = "Вплив",
+                                    minWidth = 60,
+                                    style = function(value) {
+                                        if (value < 0) {
+                                            color <- "#e00000"
+                                        } else {
+                                            color <- "#008000"
+                                        }
+                                        list(color = color)
+                                    },
+                                    format = colFormat(separators = TRUE,
+                                                    digits = 0)),
+            diff_avr_cust_trans_qty = colDef(name = "Зміна",
+                                             minWidth = 50,
+                                             style = function(value) {
+                                                 if (value < 0) {
+                                                     color <- "#e00000"
+                                                 } else {
+                                                     color <- "#008000"
+                                                 }
+                                                 list(color = color)
+                                             },
+                                             format = colFormat(
+                                                 separators = TRUE,
+                                                 digits = 1)),
+            influence_cust_trans_qty = colDef(name = "Вплив",
+                                              minWidth = 60,
+                                              style = function(value) {
+                                                  if (value < 0) {
+                                                      color <- "#e00000"
+                                                  } else {
+                                                      color <- "#008000"
+                                                  }
+                                                  list(color = color)
+                                              },
+                                              format = colFormat(
+                                                  separators = TRUE,
+                                                  digits = 0)),
+            diff_avr_trans_sum = colDef(name = "Зміна",
+                                        minWidth = 50,
+                                        style = function(value) {
+                                             if (value < 0) {
+                                                 color <- "#e00000"
+                                             } else {
+                                                 color <- "#008000"
+                                             }
+                                             list(color = color)
+                                             },
+                                        format = colFormat(separators = TRUE,
+                                                           digits = 0)),
+            influence_trans_sum = colDef(name = "Вплив",
+                                         minWidth = 60,
+                                         style = function(value) {
+                                             if (value < 0) {
+                                                 color <- "#e00000"
+                                             } else {
+                                                 color <- "#008000"
+                                             }
+                                                  list(color = color)
+                                             },
+                                         format = colFormat(separators = TRUE,
+                                                            digits = 0)),
+            diff_sales = colDef(name = "Зміна",
+                                minWidth = 50,
+                                style = function(value) {
+                                    if (value < 0) {
+                                        color <- "#e00000"
+                                    } else {
+                                        color <- "#008000"
+                                    }
+                                    list(color = color)
+                                    },
+                                format = colFormat(separators = TRUE,
+                                                   digits = 0))
+                ),
+        columnGroups = list(
+            colGroup(name = "Кількість покупців",
+                     columns = c("diff_cust_qty", "influence_cust_qty")),
+            colGroup(name = "Сер.кількість накладних",
+                     columns = c("diff_avr_cust_trans_qty",
+                                 "influence_cust_trans_qty")),
+            colGroup(name = "Сер.сума накладних",
+                     columns = c("diff_avr_trans_sum",
+                                 "influence_trans_sum")),
+            colGroup(name = "Загальна сума",
+                     columns = c("diff_sales"))
+            ),
+        bordered = TRUE
+    )
+```
+
+
+
+### Кількість унікальних покупців за останні 2 роки помісячно з виконанням плану за `r month(date_finish - months(1), label = TRUE, abbr = FALSE)`
+
+```{r}
+cust_plot_data <- sale_total %>% 
+    filter(subdiv_name %in% report_subdivs) %>% 
+    mutate(month = floor_date(as_date(date_sale_doc), "month")) %>% 
+    group_by(subdiv_name, customer_id, month) %>% 
+    summarise(cust_sum = sum(doc_sum)) %>% 
+    ungroup() %>% 
+    filter(cust_sum > 50) %>% 
+    count(subdiv_name, month)
+
+labels_data <- cust_plot_data %>%
+    filter(month == max(month)) %>% 
+    left_join(select(sale_plan_last_month, subdiv_name, plan_customers),
+              by = "subdiv_name") %>% 
+    mutate(subdiv_name = factor(subdiv_name,
+                                labels = c("Ів.-Франк.", "Кам-Поділ.", "Луцьк",
+                                           "Рівне", "Тернопіль", "Хмельницький",
+                                           "Чернівці"))) %>%
+    mutate(plan_impl = paste0(round(n / plan_customers *100), "%"))
+
+cust_plot_data %>%
+    mutate(subdiv_name = factor(subdiv_name,
+                                labels = c("Ів.-Франк.", "Кам-Поділ.", "Луцьк",
+                                           "Рівне", "Тернопіль", "Хмельницький",
+                                           "Чернівці"))) %>%
+    ggplot(aes(x = month, y = n, color = subdiv_name)) +
+    geom_line(size = 1.3) +
+    scale_color_manual(values = colors) +
+    scale_x_date(date_breaks = '2 months', 
+                 date_labels = "%b-%y") +
+    ggrepel::geom_label_repel(data = labels_data , aes(x = month,
+                                                       y = n,
+                                                       label = plan_impl,
+                                                       color = subdiv_name),
+                              size = 3, label.padding = 0.15, nudge_x = 0.25,
+                              show.legend = FALSE) +
+    theme_minimal() +
+    labs(x = '', y = 'Кількість покупців', color = 'Підрозділ') +
+    theme(axis.text.x = element_text(angle = 45))
+```
+
+
+### Кількість унікальних покупців за `r report_quarter` квартал за типами
+
+```{r}
+сust_year_data <- sale_total %>% 
+    filter(subdiv_name %in% report_subdivs,
+           date_sale_doc >= date_start,
+           date_sale_doc < date_finish) %>% 
+    group_by(subdiv_name, customer_id) %>% 
+    summarise(cust_sum = sum(doc_sum)) %>% 
+    ungroup() %>% 
+    filter(cust_sum > 50) %>% 
+    left_join(select(ref_customers, customer_id, customer_type),
+              by = "customer_id") %>% 
+    count(subdiv_name, customer_type) %>% 
+    filter(!is.na(customer_type)) %>% 
+    mutate(subdiv_name = factor(subdiv_name,
+                                labels = c("Ів.-Франк.", "Кам-Поділ.", "Луцьк",
+                                           "Рівне", "Тернопіль", "Хмельницький",
+                                           "Чернівці"))) %>% 
+    group_by(subdiv_name) %>% 
+    mutate(pct = n / sum(n),
+           lbl = scales::percent(pct))
+
+сust_year_data %>% 
+    ggplot(aes(x = as.factor(subdiv_name),
+               y = n,
+               fill = as.factor(customer_type))) + 
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = lbl), 
+              size = 3, 
+              position = position_stack(vjust = 0.5)) +
+    scale_fill_brewer(palette = 2) +
+    labs(y = "Кількість покупців", 
+         fill = "Тип покупця",
+         x = "") +
+    theme_minimal() +
+    theme(panel.grid.major.x = element_blank(),
+          axis.text.x = element_text(angle = 45))
+```
+
+
+### Середня сума накладної за останні 2 роки (грн)
+
+```{r}
+avr_trans_plot_data <- sale_total %>% 
+    filter(subdiv_name %in% report_subdivs) %>% 
+    mutate(month = floor_date(as_date(date_sale_doc), "month")) %>%
+    filter(doc_sum > 10) %>% 
+    group_by(subdiv_name, month) %>% 
+    summarise(avr_trans_sum = round(median(doc_sum))) %>% 
+    ungroup() 
+
+avr_trans_plot_data %>%
+    mutate(subdiv_name = factor(subdiv_name,
+                                labels = c("Ів.-Франк.", "Кам-Поділ.", "Луцьк",
+                                           "Рівне", "Тернопіль", "хмельницький",
+                                           "Чернівці"))) %>%
+    ggplot(aes(x = month, y = avr_trans_sum, color = subdiv_name)) +
+    geom_line(size = 1.3) +
+    scale_color_manual(values = colors) +
+    scale_x_date(date_breaks = '2 months', 
+                 date_labels = "%b-%y") +
+    theme_minimal() +
+    labs(x = '', y = 'Середня сума накладної', color = 'Підрозділ') +
+    theme(axis.text.x = element_text(angle = 45))
+```
+
+### Аналіз середньої суми накладних у `r report_quarter` кварталі
+
+```{r}
+avr_trans_sum_plot <- sale_total %>% 
+    filter(subdiv_name %in% report_subdivs,
+           date_sale_doc >= date_start,
+           date_sale_doc < date_finish) %>% 
+    filter(doc_sum > 10) %>% 
+    mutate(subdiv_name = factor(subdiv_name,
+                                labels = c("Ів.-Франк.", "Кам-Поділ.", "Луцьк",
+                                           "Рівне", "Тернопіль", "Хмельницький",
+                                           "Чернівці")))
+
+data_avarage_trans_sum <- avr_trans_sum_plot %>% 
+    group_by(subdiv_name) %>% 
+    summarise(med = round(median(doc_sum)),
+              mean = mean(doc_sum))
+
+avr_trans_sum_plot %>%
+    ggplot(aes(x = subdiv_name, y = doc_sum, fill = subdiv_name)) +
+    geom_boxplot(notch = TRUE) +
+    geom_point(data = data_avarage_trans_sum,
+               aes(x = subdiv_name, y = mean),
+               shape = 21, size = 2.5, color = "red") +
+    # stat_summary(fun = mean, geom = "point", shape = 21,
+    #              size = 2, color = "red") +
+    scale_fill_manual(values = colors) +
+    scale_y_log10(labels = scales::comma) +
+    geom_text(data = data_avarage_trans_sum, aes(subdiv_name, med, label = med), 
+              size = 3.5, hjust = -0.2) +
+    coord_flip() +
+    labs(x = NULL,
+         y = NULL) +
+    theme_minimal() +
+    theme(legend.position = "none",
+          axis.text.y = element_text(size = 11),
+          axis.text.x = element_text(size = 10))
+```
+
+
+### Середня сума щомісячних продаж покупцям за останні 2 роки (тис.грн) з виконанням плану за `r month(date_finish - months(1), label = TRUE, abbr = FALSE)`
+
+```{r}
+cust_trans_plot_data <- sale_total %>% 
+    filter(subdiv_name %in% report_subdivs,
+           doc_sum > 10) %>% 
+    mutate(month = floor_date(as_date(date_sale_doc), "month")) %>% 
+    group_by(subdiv_name, customer_id, month) %>% 
+    summarise(cust_sum = sum(doc_sum)) %>% 
+    ungroup() %>% 
+    group_by(subdiv_name, month) %>%
+    summarise(avr_cust_trans_sum = round(mean(cust_sum))) %>% 
+    ungroup()
+
+labels_data <- cust_trans_plot_data %>%
+    filter(month == max(month)) %>% 
+    left_join(sale_plan_cust, by = "subdiv_name") %>% 
+    mutate(subdiv_name = factor(subdiv_name,
+                                labels = c("Ів.-Франк.", "Кам-Поділ.", "Луцьк",
+                                           "Рівне", "Тернопіль", "Хмельницький",
+                                           "Чернівці"))) %>%
+    mutate(plan_impl = paste0(round(avr_cust_trans_sum / (plan_sum /
+                                            plan_customers) *100), "%"))
+
+cust_trans_plot_data %>%
+    mutate(subdiv_name = factor(subdiv_name,
+                                labels = c("Ів.-Франк.", "Кам-Поділ.", "Луцьк",
+                                           "Рівне", "Тернопіль", "Хмельницький",
+                                           "Чернівці"))) %>%
+    ggplot(aes(x = month, y = avr_cust_trans_sum, color = subdiv_name)) +
+    geom_line(size = 1.3) +
+    scale_color_manual(values = colors) +
+    scale_x_date(date_breaks = '2 months',
+                 date_labels = "%b-%y") +
+    ggrepel::geom_label_repel(data = labels_data , aes(x = month,
+                                                       y = avr_cust_trans_sum,
+                                                       label = plan_impl,
+                                                       color = subdiv_name),
+                              size = 2.75, label.padding = 0.15, nudge_x = 0.25,
+                              show.legend = FALSE) +
+    theme_minimal() +
+    labs(x = '', y = 'Середня сума, грн', color = 'Підрозділ') +
+    theme(axis.text.x = element_text(angle = 45))
+```
+
+
+
+### Середня кількість SKU на покупця по підрозділам у `r report_quarter` кварталі
+
+```{r}
+avr_sku_data <- sale_quarter_data_raw %>% 
+    filter(subdiv_name %in% report_subdivs) %>% 
+    left_join(select(ref_items, item_id, group_id),
+              by = "item_id") %>% 
+    left_join(select(ref_item_group, group_id, category_name),
+              by = "group_id") %>% 
+    filter(!is.na(category_name))
+
+cust_items <- avr_sku_data %>% 
+    group_by(subdiv_name, customer_id, item_id) %>% 
+    summarise(item_docs = n(),
+              item_sum = sum(item_sum)) %>% 
+    ungroup() 
+
+avr_sku_plot_data <- avr_sku_data %>% 
+    group_by(subdiv_name, customer_id, item_id) %>% 
+    summarise(item_docs = n(),
+              item_sum = sum(item_sum)) %>% 
+    ungroup() %>% 
+    group_by(subdiv_name, customer_id) %>% 
+    summarise(cust_item_qty = n()) %>% 
+    ungroup() %>%
+    mutate(subdiv_name = factor(subdiv_name,
+                                labels = c("Ів.-Франк.", "Кам-Поділ.", "Луцьк",
+                                           "Рівне", "Тернопіль", "Хмельницький",
+                                           "Чернівці")))
+
+data_avarage_sku <- avr_sku_plot_data %>% 
+    group_by(subdiv_name) %>% 
+    summarise(med = median(cust_item_qty),
+              mean = mean(cust_item_qty))
+
+avr_sku_plot_data %>%
+    ggplot(aes(x = subdiv_name, y = cust_item_qty,
+               fill = subdiv_name)) +
+    geom_boxplot(notch = TRUE) +
+    # stat_summary(fun = mean, geom = "point", shape = 21,
+    #              size = 2, color = "red") +
+    geom_point(data = data_avarage_sku,
+               aes(x = subdiv_name, y = mean),
+               shape = 21, size = 2.5, color = "red") +
+    scale_fill_manual(values = colors) +
+    scale_y_continuous(limits = c(0, 50)) +
+    #scale_y_log10(labels = scales::comma) +
+    coord_flip() +
+    geom_text(data = data_avarage_sku, aes(subdiv_name, med, label = med), 
+              size = 3.5, hjust = -0.2) +
+    labs(x = NULL,
+         y = NULL) +
+    theme_minimal() +
+    theme(legend.position = "none",
+          axis.text.y = element_text(size = 11),
+          axis.text.x = element_text(size = 10))
+```
+
+
+### Середня кількість кат.напрямків на покупця по підрозділам у `r report_quarter` кварталі
+
+```{r}
+avr_cat_plot_data <- avr_sku_data %>% 
+    group_by(subdiv_name, customer_id, category_name) %>% 
+    summarise(cat_docs = n(),
+              cat_sum = sum(item_sum)) %>% 
+    ungroup() %>% 
+    group_by(subdiv_name, customer_id) %>% 
+    summarise(cust_cat_qty = n()) %>% 
+    ungroup() %>%
+    mutate(subdiv_name = factor(subdiv_name,
+                                labels = c("Ів.-Франк.", "Кам-Поділ.", "Луцьк",
+                                           "Рівне", "Тернопіль", "Хмельницький",
+                                           "Чернівці")))
+
+data_cat_avarage <- avr_cat_plot_data %>% 
+    group_by(subdiv_name) %>% 
+    summarise(med = median(cust_cat_qty),
+              mean = mean(cust_cat_qty))
+
+avr_cat_plot_data %>%
+    ggplot(aes(x = subdiv_name, y = cust_cat_qty,
+               fill = subdiv_name)) +
+    geom_boxplot(notch = TRUE) +
+     geom_point(data = data_cat_avarage,
+               aes(x = subdiv_name, y = mean),
+               shape = 21, size = 2.5, color = "red") +
+    # stat_summary(fun = mean, geom = "point", shape = 21,
+    #              size = 2, color = "red") +
+    scale_fill_manual(values = colors) +
+    #scale_y_continuous(limits = c(0, 40)) +
+    #scale_y_log10(labels = scales::comma) +
+    coord_flip() +
+    geom_text(data = data_cat_avarage, aes(subdiv_name, med, label = med), 
+              size = 3.5, hjust = -0.2) +
+    labs(x = NULL,
+         y = NULL) +
+    theme_minimal() +
+    theme(legend.position = "none",
+          axis.text.y = element_text(size = 11),
+          axis.text.x = element_text(size = 10))
+```
+
+
+
+### Частка кат. напрямків у продажах у `r report_quarter` кварталі (за загальною сумою)
+
+```{r}
+cat_share_data <- avr_sku_data %>% 
+     # Категорії 8-16 - інші
+    mutate(category_name = ifelse(str_sub(category_name, 1, 2) %in%
+                                     c("01", "02", "03", "04","05", "06", "07"),
+                                  category_name,
+                                  "Інші")) %>% 
+    group_by(subdiv_name, category_name) %>% 
+    summarise(cat_sum = sum(item_sum)) %>% 
+    ungroup() %>% 
+    mutate(subdiv_name = factor(subdiv_name,
+                                labels = c("Ів.-Франк.", "Кам-Поділ.", "Луцьк",
+                                           "Рівне", "Тернопіль", "Хмельницький",
+                                           "Чернівці"))) %>% 
+    group_by(subdiv_name) %>% 
+    mutate(cat_share = cat_sum / sum(cat_sum),
+           lbl = scales::percent(cat_share, accuracy = 1))
+
+
+cat_share_data %>% 
+    ggplot(aes(x = as.factor(subdiv_name),
+               y = cat_share,
+               fill = as.factor(category_name))) + 
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = lbl), 
+              size = 3, 
+              position = position_stack(vjust = 0.5),
+              check_overlap = TRUE) +
+    scale_y_continuous(labels = scales::percent) +
+    scale_fill_brewer(palette = "Set3") +
+    coord_flip() +
+    labs(y = "Частка кат.напр.", 
+         fill = "",
+         x = "") +
+    theme_minimal() +
+    theme(panel.grid.major.x = element_blank(),
+          legend.position = "bottom")
+```
+
+
+### Кількість проданих SKU за підрозділами за `r report_quarter` квартал
+
+```{r}
+total_sku_plot_data <- avr_sku_data %>%
+    mutate(subdiv_name = factor(subdiv_name,
+                                labels = c("Ів.-Франк.", "Кам-Поділ.", "Луцьк",
+                                           "Рівне", "Тернопіль", "Хмельницький",
+                                           "Чернівці"))) %>% 
+    group_by(subdiv_name, item_id) %>% 
+    summarise(item_sum = sum(item_sum)) %>% 
+    ungroup() %>% 
+    count(subdiv_name)
+
+total_sku_plot_data %>% 
+    ggplot(aes(x = reorder(subdiv_name, n),
+               y = n)) +
+    geom_bar(stat="identity", aes(fill = n)) +
+    geom_label(aes(label = n), size = 4.5) +
+    scale_fill_gradient(low="#59BEC4", high="#048B9F", guide = "none") +
+    labs(x = "", y = "") +
+    coord_flip()+
+    theme_minimal() +
+    theme(axis.text.y = element_text(size = 10),
+          axis.text.x = element_blank(),
+          legend.text = element_text(size = 8),
+          panel.grid = element_blank())
+```
+
+
+### Середній час виконання замовлення покупців по підрозділам (дні)
+
+```{r}
+subdiv_lead_time %>% 
+    ggplot(aes(y = reorder(subdiv_name, avr_lead_time),
+               x = avr_lead_time)) +
+    geom_col(aes(fill = avr_lead_time)) +
+    scale_x_continuous(limits = c(0, 10)) +
+    geom_label(aes(label = avr_lead_time),
+              size = 4.5) +
+    scale_fill_gradient(low="#048B9F", high="#F46D43", guide = "none") +
+    labs(x = "", y = "") +
+    theme_minimal() +
+    theme(axis.text.y = element_text(size = 12),
+          axis.text.x = element_blank(),
+          panel.grid = element_blank())
+```
+
+
+### Склад відвантаження покупцям за підрозділами (частка за проданими одиницями)
+
+```{r}
+store_data <- sale_quarter_data_raw %>% 
+    filter(subdiv_name %in% report_subdivs) %>% 
+    left_join(select(ref_items, item_id, group_id),
+              by = "item_id") %>% 
+    left_join(select(ref_item_group, group_id, category_name),
+              by = "group_id") %>% 
+    filter(!is.na(category_name)) %>% 
+    group_by(subdiv_name, store_name) %>% 
+    summarise(qty_items = sum(item_qty)) %>% 
+    ungroup() %>% 
+    
+    left_join(select(ref_store, store_name, subdiv_store = subdiv_name)) %>% 
+    mutate(subdiv_name = str_replace(subdiv_name, " сервіс", ""),
+           subdiv_name = str_replace(subdiv_name, " Сервіс", ""),
+           subdiv_store = str_replace(subdiv_store, " Роздріб", ""),
+           subdiv_store = str_replace(subdiv_store, " роздріб", ""),
+           store_final = case_when(
+               store_name  == "Головний склад"            ~ "ГС",
+               store_name  == "Луцьк Розподільчий склад"  ~ "ЛуцькРЦ",
+               subdiv_name == subdiv_store | 
+                   (subdiv_name == "Луцьк см сервіс" &
+                       subdiv_store == "Луцьк Ковельськ") ~ "Магазин",
+               TRUE                                       ~ "ІншіМаг."
+           )) %>% 
+    group_by(subdiv_name, store_final) %>% 
+    summarise(qty_total = sum(qty_items)) %>% 
+    ungroup() %>% 
+    group_by(subdiv_name) %>% 
+    mutate(prop = qty_total / sum(qty_total),
+           lbl = scales::percent(prop, accuracy = 1)) %>% 
+    ungroup()
+
+store_data %>% 
+    ggplot(aes(x = as.factor(subdiv_name),
+               y = prop,
+               fill = as.factor(store_final))) + 
+    geom_bar(stat = "identity",
+             position = "fill") +
+    scale_y_continuous(breaks = seq(0, 1, .2), 
+                       label = scales::percent) +
+    geom_text(data = filter(store_data, prop > 0.03),
+              aes(label = lbl), 
+              size = 3, 
+              position = position_stack(vjust = 0.5)) +
+    scale_fill_brewer(palette = "Set3") +
+    coord_flip() +
+    labs(y = "Частка", 
+         fill = "",
+         x = "",
+         title = "") +
+    theme_minimal() +
+    theme(legend.text = element_text(size = 6),
+          axis.text.x = element_text(size = 6),
+          axis.title.x = element_text(size = 8),
+          axis.text.y = element_text(size = 7),
+          legend.position = "top",
+          legend.text.align = 0.8,
+          legend.spacing.x = unit(0.6, 'cm'))
+```
+
+
+### Дебіторськая заборгованість за підрозділами за строками виникнення на `r date_finish`
+
+```{r}
+debt_subdiv <- cust_unpaid_docs_finish_df %>% 
+    left_join(select(ref_contract, contract_id, contract_arrears_day)) %>% 
+    mutate(doc_recency = as.integer(date_finish - date_sale_doc),
+           debt_period = case_when(
+               is.na(contract_arrears_day)               ~ case_when(
+                   doc_recency <= 7  ~ "Протер. до 7дн",
+                   doc_recency <= 30 ~ "Протер. 7-30дн",
+                   TRUE              ~ "Протер. >30дн"),
+               doc_recency <= contract_arrears_day       ~ "Непротермінована",
+               doc_recency <= contract_arrears_day + 7   ~ "Протер. до 7дн",
+               doc_recency <= contract_arrears_day + 30  ~ "Протер. 7-30дн",
+               TRUE                                      ~ "Протер. >30дн"
+           ),
+           customer_id = partner_id) %>% 
+    
+    mutate(subdiv_name = ifelse(subdiv_name == "Луцьк Ковельськ",
+                                "Луцьк см сервіс",
+                                subdiv_name)) %>% 
+    filter(subdiv_name %in% report_subdivs) %>% 
+    
+    group_by(subdiv_name, debt_period) %>% 
+    summarise(debt_period_sum = sum(doc_moving_sum)) %>%
+    ungroup() %>% 
+ 
+    group_by(subdiv_name) %>% 
+    mutate(prop = debt_period_sum / sum(debt_period_sum),
+           lbl = scales::percent(prop, accuracy = 1),
+           term = fct_relevel(debt_period,
+                              "Непротермінована",
+                              "Протер. до 7дн",
+                              "Протер. 7-30дн",
+                              "Протер. >30дн"))
+
+debt_subdiv %>% 
+    ggplot(aes(x = as.factor(subdiv_name),
+               y = prop,
+               fill = as.factor(term))) + 
+    geom_bar(stat = "identity",
+             position = "fill") +
+    scale_y_continuous(breaks = seq(0, 1, .2), 
+                       label = scales::percent) +
+    geom_text(aes(label = lbl),
+              size = 3,
+              position = position_stack(vjust = 0.5),
+              check_overlap = TRUE) +
+    scale_fill_brewer(palette = "Set3") +
+    coord_flip() +
+    labs(y = "Частка", 
+         fill = "",
+         x = "",
+         title = "") +
+    theme_minimal() +
+    theme(legend.text = element_text(size = 6),
+          axis.text.x = element_text(size = 6),
+          axis.title.x = element_text(size = 8),
+          axis.text.y = element_text(size = 7),
+          legend.position = "top",
+          legend.text.align = 0.4,
+          legend.spacing.x = unit(0.5, 'cm'))
+```
+
+
+### GMROL співробітника за підрозділами та сервіс-фактор
+
+```{r}
+sale_df %>% 
+    select(subdiv_name, gmrol, servis_factor) %>% 
+    mutate(gmrol = as.numeric(gmrol)) %>% 
+    ggplot(aes(x = reorder(subdiv_name, gmrol), y = gmrol,
+               label = servis_factor)) +
+    geom_col(aes(fill = gmrol)) +
+    scale_fill_gradient(low="#FEE08B", high="lightblue", guide = "none") +
+    geom_text(aes(y = gmrol), size = 3.5,position = position_stack(vjust=0.9)) +
+    # scale_y_continuous(breaks = seq(0, 420, 30)) +
+    coord_flip() +
+    labs(x = "", y = "GMROL(тис.грн)") +
+    theme_minimal() +
+    theme(panel.grid.major.y = element_blank())
+```
+
+
+### Надані знижки як частка від базових цін
+
+```{r}
+discount_data <- sale_quarter_data_raw %>% 
+    filter(subdiv_name %in% report_subdivs) %>% 
+    group_by(subdiv_name, nmbr_sale_doc, date_sale_doc, item_id) %>% 
+    summarise(item_qty = sum(item_qty),
+              item_sum = sum(item_sum)) %>% 
+    ungroup() %>% 
+    filter(item_qty > 0)
+
+price_log <- price_items_log(date_start + years(2000),
+                             date_finish + years(2000),
+                             "000000010") %>% 
+    filter(item_id %in% unique(discount_data$item_id))
+
+discount_df <- discount_data %>% 
+    full_join(select(price_log, date_setting:item_price), by = "item_id") %>% 
+    group_by(nmbr_sale_doc, date_sale_doc, item_id) %>% 
+    filter(date_setting == max(date_setting[date_setting < date_sale_doc])) %>% 
+    mutate(base_price_sum = item_price * item_qty,
+           disc_sum = base_price_sum - item_sum) %>% 
+    group_by(subdiv_name) %>% 
+    summarise(net_sales = sum(item_sum),
+              discount_sum = sum(disc_sum)) %>% 
+    mutate(discount_share = round(discount_sum / (net_sales + discount_sum), 3),
+           lbl = scales::percent(discount_share))
+
+discount_df %>% 
+    ggplot(aes(x = reorder(subdiv_name, discount_share),
+               y = discount_share)) +
+    geom_bar(stat="identity", aes(fill = discount_share)) +
+    geom_label(aes(label = lbl), size = 4.5) +
+    scale_fill_gradient(low="#59BEC4", high="#FEE08B", guide = "none") +
+    labs(x = "", y = "") +
+    coord_flip()+
+    theme_minimal() +
+    theme(axis.text.y = element_text(size = 10),
+          axis.text.x = element_blank(),
+          legend.text = element_text(size = 8),
+          panel.grid = element_blank())
+```
+
+
+
+### Рейтинг підрозділів за розглянутими показниками
+
+```{r}
+category_tbl <- cat_share_data %>% 
+    filter(str_sub(category_name, 1, 2) %in%
+                                     c("02", "03", "04", "06", "07")) %>% 
+    mutate(category_name = case_when(
+        str_sub(category_name, 1, 2) %in% c("02") ~ "Склад-магазин",
+        str_sub(category_name, 1, 2) %in% c("04") ~ "Прибирання",
+        TRUE                                      ~ "Канцтовари")) %>% 
+    group_by(subdiv_name, category_name) %>% 
+    summarise(cat_share = round(sum(cat_share), 3)) %>% 
+    pivot_wider(names_from = "category_name", 
+                values_from = "cat_share")
+
+rating_df <- sale_df %>% 
+    select(subdiv_name, gmrol, servis_factor, profitability, receivables,
+           avr_cust_items, avr_cust_categories, avr_trans_sum) %>% 
+    left_join(subdiv_lead_time, by = "subdiv_name") %>% 
+    left_join(filter(debt_subdiv, debt_period == "Непротермінована") %>% 
+                  select(subdiv_name, unoverdue_prop = prop),
+              by = "subdiv_name") %>% 
+    left_join(select(discount_df, subdiv_name, discount_share),
+              by = "subdiv_name") %>% 
+    mutate(subdiv_name = factor(subdiv_name,
+                                labels = c("Ів.-Франк.", "Кам-Поділ.", "Луцьк",
+                                           "Рівне", "Тернопіль", "Хмельницький",
+                                           "Чернівці"))) %>%
+    left_join(total_sku_plot_data, by = "subdiv_name") %>% 
+    left_join(category_tbl, by = "subdiv_name") %>% 
+
+    mutate(across(where(is.numeric) & !c(receivables, avr_lead_time, discount_share),
+                  ~ min_rank(desc(.)))) %>% 
+    mutate(across(c(receivables, avr_lead_time, discount_share), ~ min_rank(.))) %>% 
+    rowwise() %>% 
+    mutate(total_score = rowSums(across(where(is.numeric))) + gmrol + servis_factor) %>% 
+    ungroup() %>% 
+    mutate(total_score = min_rank(total_score)) %>% 
+    rename("Сервіс_фактор" = servis_factor, "Рентабельність" = profitability,
+           "ОДЗ" = receivables, "Сер.кіл-ть SKU" = avr_cust_items,
+           "Сер.кіл-ть КН" = avr_cust_categories,
+           "Сер.сума накладн." = avr_trans_sum,
+           "Сер.час викон.зам." = avr_lead_time,
+           "Частка непротерм.ДЗ" = unoverdue_prop, "Заг.кіл-ть SKU" = n,
+           "Частка знижок" = discount_share,
+           "Загальний рейтинг" = total_score) %>% 
+    pivot_longer(-subdiv_name) %>% 
+    pivot_wider(name, names_from = "subdiv_name", values_from = value) %>% 
+    rename("Показник" = name)
+
+writexl::write_xlsx(rating_df, "data/рейтинг_СМ_В2В.xlsx")
+
+rating_df %>% 
+    reactable(striped = TRUE, pagination = FALSE,
+              highlight = TRUE,
+              columns = list(
+                  Показник = colDef(minWidth = 120),
+                  Луцьк= colDef(maxWidth = 65),
+                  Рівне = colDef(maxWidth = 65),
+                  Хмельницький = colDef(minWidth = 120)),
+              rowStyle = function(index) {
+                  if (index == 15) list(fontWeight = "bold",
+                                        background = "#D3AE7C")
+              },
+              bordered = TRUE
+    )
+```
+

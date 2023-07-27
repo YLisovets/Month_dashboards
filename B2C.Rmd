@@ -2,9 +2,11 @@
 title: "Звіт з В2С за `r lubridate::month(lubridate::rollback(Sys.Date()), label = TRUE, abbr = FALSE)`"
 output: 
   flexdashboard::flex_dashboard:
-     orientation: rows
-     vertical_layout: scroll
-     theme:
+    logo: "data/logo.png"
+    css: "custom.css"
+    orientation: rows
+    vertical_layout: scroll
+    theme:
       version: 4
       primary: "red"
 ---
@@ -12,15 +14,22 @@ output:
 ```{r setup, include=FALSE}
 library(flexdashboard)
 library(tidyverse)
-library(lubridate)
+library(timetk)
 library(reactablefmtr)
 library(httr)
 library(jsonlite)
+
+library(DBI)
+library(odbc)
+library(dbplyr)
 ```
 
 ```{r preparation}
 source("global.R", local = FALSE)
-rm(list = ls(pattern = "tbl", all.names = TRUE))
+
+con <- connect_to_db()
+
+get_references()
 
 date_start <- rollback(Sys.Date(), roll_to_first = TRUE) - months(1)
 date_finish <- date_start + months(1)
@@ -96,6 +105,8 @@ plan_retail_data <- sale_plan_retail(date_start + years(2000),
     group_by(subdiv_name) %>% 
     summarise(plan_sum = sum(plan_sale),
               plan_profit = sum(plan_profit))
+
+dbDisconnect(con)
 ```
 
 ```{r main_indicators}
@@ -193,23 +204,31 @@ retail_df <- sale_check_df %>%
     left_join(regular_cust) %>%
     mutate(across(where(is.numeric), ~ifelse(is.na(.), 0, .))) %>% 
     janitor::adorn_totals(where = "row", name = "ВСЕГО") %>%
-    mutate(plan_implement = round(revenue / plan_sum, 3),
-           revenue_growth = ifelse(revenue_prev_year > 0, 1, 0) *
-                                   round(revenue / revenue_prev_year, 2),
+    mutate(plan_implement = ifelse(plan_sum == 0,
+                                   0,
+                                   round(revenue / plan_sum, 3)),
+           revenue_growth = ifelse(revenue_prev_year == 0,
+                                   0,
+                                   ifelse(revenue_prev_year > 0, 1, 0) *
+                                       round(revenue / revenue_prev_year, 2)),
            checks_nmbr_impl = ifelse(plan_ind_nrow > 0, 1, 0) *
                                      round(total_checks / checks_plan,
                                            3),
-           total_checks_growth = ifelse(checks_prev_year > 0, 1, 0) *
-                                        round(total_checks / 
-                                                  checks_prev_year, 2),
+           total_checks_growth = ifelse(checks_prev_year == 0,
+                                        0,
+                                        ifelse(checks_prev_year > 0, 1, 0) *
+                                            round(total_checks / 
+                                                      checks_prev_year, 2)),
            one_item_checks_share = round(one_item_checks_qty/total_checks, 3),
            avr_check_sum = round(revenue / total_checks, 1),
            avr_check_impl = ifelse(plan_ind_nrow > 0, 1, 0) *
                                    round(avr_check_sum /
                                       (plan_sum / checks_plan), 3),
-           avr_check_growth = ifelse(checks_prev_year > 0, 1, 0) *
+           avr_check_growth = ifelse(checks_prev_year == 0,
+                                     0,
+                                     ifelse(checks_prev_year > 0, 1, 0) *
                                      round(avr_check_sum / (revenue_prev_year /
-                                                         checks_prev_year), 2),
+                                                         checks_prev_year), 2)),
            avr_check_sku = round(total_items / total_checks, 1),
            row_n = row_number(),
            check_sku_plan = ifelse(row_n == max(row_n),
@@ -532,13 +551,13 @@ sale_history_by_year <- sale_history %>%
     summarise(revenue = round(sum(checks_sum) / 1000000, 2),
               checks_nmbr = sum(checks_qty))
 
-library(timetk)
 sale_history_by_year %>% 
     summarise_by_time(date, .by = "month", sales = sum(revenue)) %>% 
     plot_time_series(date, sales,
                      #.facet_scales = "free",
                      .title = "",
-                     .interactive = TRUE)
+                     .interactive = TRUE) %>% 
+    layout(xaxis = list(tickformat="%m\n%Y"))
 ```
 
 ### Рентабельність продажів по підрозділам (ТОП-3) {data-width=400}
@@ -755,10 +774,11 @@ sale_history_by_year %>%
                      .smooth_period = "auto",
                      .facet_scales = "free",
                      .title = "",
-                     .interactive = TRUE)
+                     .interactive = TRUE) %>% 
+    layout(xaxis = list(tickformat="%m\n%Y"))
 ```
 
-### Зміна середнього чеку за останні 4 тижня {data-width=400}
+### Сума середнього чеку за останні 4 тижня {data-width=400}
 
 ```{r}
 last_4week_data %>% 
@@ -770,6 +790,11 @@ last_4week_data %>%
                    colour = "darkred"),
                linetype = "dashed",
                size = 1) +
+    scale_x_date(date_labels = "%b %d",
+                 minor_breaks = NULL,
+                 breaks = seq(min(last_4week_data$week_last_day),
+                             max(last_4week_data$week_last_day),
+                             length=4)) +
     ggplot2::annotate("text", 
                       last_4week_data$week_last_day[2], 
                       avr_check_plan + 1, 
@@ -795,6 +820,11 @@ last_4week_data %>%
                    colour = "darkred"),
                linetype = "dashed",
                size = 1) +
+    scale_x_date(date_labels = "%b %d",
+                 minor_breaks = NULL,
+                 breaks = seq(min(last_4week_data$week_last_day),
+                             max(last_4week_data$week_last_day),
+                             length=4)) +
     ggplot2::annotate("text", 
                       last_4week_data$week_last_day[2], 
                       avr_check_sku_plan + 0.1, 

@@ -2,6 +2,8 @@
 title: "Звіт з логістики за `r lubridate::month(lubridate::rollback(Sys.Date()), label = TRUE, abbr = FALSE)`"
 output: 
   flexdashboard::flex_dashboard:
+    logo: "data/logo.png"
+    css: "custom.css"
     orientation: rows
     vertical_layout: scroll
     theme:
@@ -12,13 +14,19 @@ output:
 ```{r setup, include=FALSE}
 library(flexdashboard)
 library(tidyverse)
-library(lubridate)
 library(plotly)
+
+library(DBI)
+library(odbc)
+library(dbplyr)
 ```
 
 ```{r preparation}
 source("global.R", local = FALSE)
-rm(list = ls(pattern = "tbl", all.names = TRUE))
+
+con <- connect_to_db()
+
+get_references()
 
 date_start <-  rollback(Sys.Date(), roll_to_first = TRUE) - months(1) #as.Date("2022-02-01")
 date_finish <- date_start + months(1)
@@ -173,14 +181,16 @@ store_space_workload_fn <- function(store) {
         left_join(select(sale_raw, sale_doc_nmbr, date, item_id, item_qty),
               by = c("nmbr_sale_doc" = "sale_doc_nmbr",
                      "date_sale_doc" = "date")) %>% 
-        select(item_id, item_qty_sale = item_qty)
+        group_by(item_id) %>% 
+        summarise(item_qty_sale = sum(item_qty))
  
     not_delivered_moving_doc_items <- not_delivered_doc %>% 
         filter(!is.na(nmbr_moving_out)) %>% 
         left_join(select(df_moving_out, nmbr_moving_out, date_moving_out,
                          item_id, item_qty),
                   by = c("nmbr_moving_out", "date_moving_out")) %>% 
-    select(item_id, item_qty_moving = item_qty)       
+        group_by(item_id) %>% 
+        summarise(item_qty_moving = sum(item_qty))       
 
     not_delivered_items <- full_join(not_delivered_sale_doc_items,
                                      not_delivered_moving_doc_items,
@@ -241,7 +251,7 @@ logistic_exp_per_unit <- total_exp_share$exp_per_units_sold[month =
                                                               month(date_start)]
 
 fig1 <- total_exp_share %>% 
-    ggplot(aes(x = month, y = exp_share, group = 1)) + 
+    ggplot(aes(x = factor(month), y = exp_share, group = 1)) + 
     geom_line(size = 1.5, color = "steelblue") +
     geom_point(shape = 21, size = 3, fill = "steelblue") +
     scale_y_continuous(label = scales::percent) +
@@ -251,7 +261,7 @@ fig1 <- total_exp_share %>%
          title = "")
 
 fig2 <- total_exp_share %>% 
-    ggplot(aes(x = month, y = exp_per_units_sold, group = 1)) + 
+    ggplot(aes(x = factor(month), y = exp_per_units_sold, group = 1)) + 
     geom_line(size = 1.5, color = "steelblue") +
     geom_point(shape = 21, size = 3, fill = "steelblue") +
     theme_minimal() +
@@ -265,9 +275,7 @@ sale_cur_month <- sale_raw %>%
     left_join(select(ref_subdiv, subdiv_name, subdiv_parent),
               by = "subdiv_name") %>% 
     filter(subdiv_parent %in% c("КОРВЕТ", "Регіональні магазини")) %>% 
-    mutate(store = ifelse(!is.na(check_store),
-                          check_store,
-                          sale_doc_store),
+    mutate(store = store_id,
            sale_doc = ifelse(!is.na(check_nmbr),
                              check_nmbr,
                              sale_doc_nmbr)) %>% 
@@ -572,7 +580,9 @@ fig_receipt_by_store <- receipt_by_store %>%
 sale_by_organization <- sale_raw %>% 
     filter(month == month(date_start)) %>% 
     mutate(type_organization = case_when(
-        organiz_id == "000000001" ~ "КОРВЕТ ф1",
+        organiz_id == "000000001" & (is.na(is_cash) |
+                                         !is_cash) ~ "КОРВЕТ ф1",
+        organiz_id == "000000001" & is_cash ~ "КОРВЕТ ф2",
         TRUE                      ~ "ПП"
     )) %>% 
     group_by(type_organization) %>% 
@@ -702,7 +712,8 @@ delivery_df <- delivery_raw %>%
     filter(store_name == deliv_order_store |
                (store_name == intermediate_store & to_intermediate == FALSE) |
                (store_id == "000000001" & deliv_order_store_id == "000000006" &
-                    is.na(recipient_store) & is.na(intermediate_store)))
+                    is.na(recipient_store) & is.na(intermediate_store)) |
+               (store_id %in% "000000022" & recipient_store %in% "000001110"))
 
 delivery_weight <- delivery_df %>% 
     group_by(nmbr_delivery, date_delivery) %>%
@@ -754,15 +765,16 @@ fig_load_factor <- load_factor_data %>%
 delivery_with_sale_doc <- delivery_df %>% 
     filter(!is.na(nmbr_deliv_order)) %>% 
     left_join(select(delivery_order_raw, nmbr_deliv_order, date_deliv_order,
-                     nmbr_sale_doc, date_sale_doc),
+                     deliv_type, nmbr_sale_doc, date_sale_doc),
               by = c("nmbr_deliv_order", "date_deliv_order")) %>% 
     left_join(select(sale_with_orders, nmbr_sale_doc, date_sale_doc, 
                      subdiv_name, customer_id, doc_sum),
               by = c("nmbr_sale_doc", "date_sale_doc"))
-    
+
 
 avr_delivery_sale_doc_amount <- delivery_with_sale_doc %>% 
-    filter(!is.na(nmbr_sale_doc)) %>% 
+    filter(deliv_type %in% "Склад - двери",
+           !is.na(nmbr_sale_doc)) %>% 
     group_by(nmbr_delivery, date_delivery, subdiv_name, customer_id) %>% 
     summarise(delivery_sum = sum(doc_sum)) %>% 
     ungroup()
@@ -911,7 +923,8 @@ fig_deliv_workload <- delivery_crew_workload %>%
 
 store_for_delivery <- ref_store %>% 
     filter(parent_store == "Товар",
-           store_location != "")
+           store_location != "",
+           !store_id %in% "000001111")  # Луцьк Ковельська - знаходиться разом з Розподільчим складом
 
 distribution_stores <- unique(na.omit(ref_store$distribution_store))
 
@@ -941,20 +954,24 @@ cleared_deliveries <- delivery_with_sale_doc %>%
                  (deliv_order_store_id %in% c("000000001") |
                       (!is.na(intermediate_store) & intermediate_store ==
                            "Головний склад"))),
-           !(route_id == "000000106" & !is.na(nmbr_moving_out)),
-           !(deliv_type %in% c("Перевозчик") & !is.na(nmbr_moving_out))
+           !(route_id %in% "000000106" & !is.na(nmbr_moving_out)),
+           !(deliv_type %in% c("Перевозчик") & !is.na(nmbr_moving_out)),
+           !(route_id %in% "000000110" & !is.na(recipient_store) &
+                 !recipient_store %in% "000001110"),
+           !(direction %in% "Волинська обл." & recipient_store %in% "000000001")
            )
 
 deliveries_summary <- cleared_deliveries %>% 
-    group_by(nmbr_delivery, date_delivery, store_id,) %>% 
+    filter(!recipient_store %in% "000001113") %>%               # Склад возврат)
+    group_by(nmbr_delivery, date_delivery, store_id) %>% 
     summarise(driver = first(driver),
               forwarder = first(forwarder),
               direction = first(direction),
               route_id = first(route_id),
-              store_id = first(store_id),
               vehicle_name = first(vehicle_name),
               distance = first(speedo_finish) - first(speedo_start),
-              customers_qty = n_distinct(customer_id, deliv_address, na.rm = TRUE),
+              customers_qty = n_distinct(customer_id, deliv_address,
+                                         na.rm = TRUE),
               customer_sum = sum(doc_sum, na.rm = TRUE),
               store_qty = n_distinct(recipient_store, na.rm = TRUE),
               store_list = ifelse(store_qty == 0,
@@ -968,7 +985,9 @@ distinct_moving_out <- deliveries_summary %>%
     left_join(select(ref_route, route_id, route_parent),
               by = "route_id") %>% 
     filter(route_parent != "Районы" |
-               (route_parent == "Районы" & route_id == "000000110")) %>% 
+               (route_parent == "Районы" & route_id == "000000110"),
+           !(direction == "Хмельницкий" & str_detect(store_list, "000001073"))
+           )%>% 
     distinct(store_id, store_list, direction) %>% 
     filter(store_list != "") %>% 
     splitstackshape::cSplit(splitCols = "store_list", ", ", type.convert = FALSE,
@@ -989,20 +1008,26 @@ distance_moving_out_data <- distinct_moving_out %>%
 #     filter(store == "store_id") %>% 
 #     ungroup() %>% 
 #     select(id, store_address)
-
-
-library(tidygeocoder)
+# write_rds(distance_moving_out_data, "data/distance_moving_out_data.rds")
+# distance_moving_out_data <- read_rds("data/distance_moving_out_data.rds")
+#library(tidygeocoder)
 library(sf)
 library(osrm)
 
 store_geocode <- distance_moving_out_data %>% 
-    distinct(store_address) %>% 
-    mutate(store_address = str_replace(store_address, "м.", ""),
-           store_address = str_replace(store_address, "вул. проспект",
-                                       "проспект"),
-           store_address = str_trim(store_address, side = "left")) %>% 
-    geocode(method = "osm",
-            address = store_address)
+    distinct(value, store_address) %>% 
+    left_join(ref_delivery_addresses %>% 
+                  filter(!is.na(store_id),
+                         is_main == TRUE) %>%
+                  select(store_id, lat, long),
+              by = c("value" = "store_id"))
+    # mutate(store_address = str_replace(store_address, "м.", ""),
+    #        store_address = str_replace(store_address, "вул. проспект",
+    #                                    "проспект"),
+    #        store_address = str_trim(store_address, side = "left")) %>% 
+    # geocode(method = "osm",
+    #         address = store_address)
+
 
 distance_fn <- function(data) {
     route <- data %>% 
@@ -1016,10 +1041,10 @@ distance_fn <- function(data) {
 distance_moving_out <- distance_moving_out_data %>% 
     select(id, store_address) %>% 
     #add_row(sender_store) %>% 
-    mutate(store_address = str_replace(store_address, "м.", ""),
-           store_address = str_replace(store_address,"вул. проспект",
-                                       "проспект"),
-           store_address = str_trim(store_address, side = "left")) %>% 
+    # mutate(store_address = str_replace(store_address, "м.", ""),
+    #        store_address = str_replace(store_address,"вул. проспект",
+    #                                    "проспект"),
+    #        store_address = str_trim(store_address, side = "left")) %>% 
     group_by(id) %>% 
     nest() %>% 
     transmute(moving_out_distance = map_dbl(data, distance_fn)) %>% 
@@ -1115,6 +1140,7 @@ avr_delivery_cost <- round((sum(deliveries_by_auto$driver_salary) +
                              sum(deliveries_by_auto$total_cust_deliveries))
 
 fig_deliv_cost <- deliveries_by_auto %>% 
+    filter(total_distance > 500) %>% 
     slice_max(cost_delivery, n = 3) %>% 
     ggplot(aes(x = reorder(vehicle_name, cost_delivery, decreasing = TRUE),
                y = cost_delivery)) +
@@ -1132,7 +1158,8 @@ fig_deliv_cost <- deliveries_by_auto %>%
           panel.grid.major.y = element_blank(),
           panel.grid.major.x = element_blank())
 
-fig_1km_cost<- deliveries_by_auto %>% 
+fig_1km_cost <- deliveries_by_auto %>% 
+    filter(total_distance > 500) %>% 
     slice_max(cost_1km, n = 3) %>% 
     ggplot(aes(x = reorder(vehicle_name, cost_1km, decreasing = TRUE),
                y = cost_1km)) +
@@ -1236,7 +1263,7 @@ fig_suppl_inspection_by_supplier <- suppl_inspection_by_supplier %>%
     geom_text(
         aes(label = round(avr_inspection_duration)),
         size = 6,
-        hjust = 0, position = position_dodge(.9)
+        hjust = "inward", position = position_dodge(.9)
     ) +
     ylim(0, max_avr_inspection_duration_by_supplier * 1.35) +
     coord_flip() +
@@ -1573,9 +1600,14 @@ stores_worker_data <- bind_rows(supplier_inspection_user_data,
     ungroup() %>% 
     group_by(user_id, date_start) %>% 
     mutate(first_doc_time = hour(min(time_start)),
-           last_doc_time  = hour(max(time_finish[date_start == date_finish]))
+           last_doc_time  = ifelse(is.na(hour(max(time_finish[date_start == date_finish]))),
+                                   hour(max(time_start)),
+                                   hour(max(time_finish[date_start == date_finish])))
            ) %>% 
-    ungroup()
+    ungroup() %>% 
+    mutate(last_doc_time = ifelse(is.na(last_doc_time),
+                                  hour(max(time_start)),
+                                  last_doc_time))
 
 start_doc_time_by_workers <- stores_worker_data %>% 
     distinct(user_id, date_start, first_doc_time)
@@ -1660,7 +1692,7 @@ store_operations <- stores_worker_df %>%
     left_join(select(work_time_df, individ_id, subdiv_name),
               by = c("user_id" = "individ_id")) %>%
     group_by(subdiv_name, type_operation) %>%
-    summarise(total_operation_time = sum(user_oper_working_time)) %>% 
+    summarise(total_operation_time = sum(user_oper_working_time, na.rm = TRUE)) %>% 
     ungroup() %>% 
     filter(!is.na(subdiv_name)) %>% 
     group_by(subdiv_name) %>% 
@@ -1684,7 +1716,7 @@ fig_store_operations <- store_operations %>%
     scale_y_continuous(breaks = seq(0, 1, .2), 
                        label = scales::percent) +
     geom_text(aes(label = scales::percent(operation_share, accuracy = 1)),
-              size = 3.5,
+              size = 3,
               position = position_stack(vjust = 0.5)) +
     scale_fill_brewer(palette = "Pastel1") +
     coord_flip() +
@@ -1694,10 +1726,10 @@ fig_store_operations <- store_operations %>%
          title = "") +
     theme_minimal() +
     theme(legend.position = "top",
-          legend.text = element_text(size = 7.5),
-          legend.text.align = 0.8,
-          legend.spacing.x = unit(0.7, 'cm'),
-          axis.text.y = element_text(size = 11))
+          legend.text = element_text(size = 6),
+          legend.text.align = 0.1,
+          legend.spacing.x = unit(0.1, 'cm'),
+          axis.text.y = element_text(size = 10))
 
 distribution_stores_salaries <- current_month_salary %>% 
     filter(subdiv_name %in% distribution_stores_subdiv,
@@ -1794,13 +1826,13 @@ cost_operations_tbl <- cost_operations %>%
         ))
 
 
-store_space__workload <- tibble(store = distribution_stores) %>% 
+store_space_workload <- tibble(store = distribution_stores) %>% 
     mutate(data = map(store, store_space_workload_fn)) %>% 
     unnest(cols = c(data)) %>% 
     left_join(select(ref_store, store_id, store_name),
               by = c("store" = "store_id"))
 
-fig_store_space_workload <- store_space__workload %>% 
+fig_store_space_workload <- store_space_workload %>% 
     ggplot(aes(x = reorder(store_name, store_workload),
                y = store_workload)) +
     geom_bar(stat = "identity", fill = "lightblue") +
@@ -1814,7 +1846,9 @@ fig_store_space_workload <- store_space__workload %>%
     labs(x = "", y = "") +
     theme(axis.text.y = element_text(size = 16),
           axis.text.x = element_blank(),
-          panel.grid = element_blank())   
+          panel.grid = element_blank()) 
+
+dbDisconnect(con)
 ```
 
 
@@ -1869,7 +1903,7 @@ ggplotly(fig2, tooltip = "y") %>%
     config(displayModeBar = FALSE)
 ```
 
-### Найгірші підрозділи з рівеня доступності запасів
+### Найгірші підрозділи з рівня доступності запасів
 
 ```{r}
 fig_available_level
@@ -2219,14 +2253,16 @@ Row {data-height=100}
 
 ```{r}
 valueBox(
-  value = avr_suppl_inspection_time)
+  value = avr_suppl_inspection_time, 
+  color =  "primary")
 ```
 
 ### Середній час на приймання по внутр.переміщ., хв.
 
 ```{r}
 valueBox(
-  value = avr_moving_inspection_time)
+  value = avr_moving_inspection_time,
+  color =  "primary")
 ```
 
 Row {data-height=200}
@@ -2282,14 +2318,16 @@ Row {data-height=100}
 
 ```{r}
 valueBox(
-  value = avr_customer_assembly_time)
+  value = avr_customer_assembly_time,
+  color =  "primary")
 ```
 
 ### Середній час на збирання внутр.переміщ., хв.
 
 ```{r}
 valueBox(
-  value = avr_moving_assembly_time)
+  value = avr_moving_assembly_time,
+  color =  "primary")
 ```
 
 Row {data-height=200}

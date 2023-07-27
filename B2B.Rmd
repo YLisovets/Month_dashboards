@@ -2,6 +2,8 @@
 title: "Звіт з В2B за `r lubridate::month(lubridate::rollback(Sys.Date()), label = TRUE, abbr = FALSE)`"
 output: 
   flexdashboard::flex_dashboard:
+    logo: "data/logo.png"
+    css: "custom.css"
     orientation: rows
     vertical_layout: scroll
     theme:
@@ -12,13 +14,19 @@ output:
 ```{r setup, include=FALSE}
 library(flexdashboard)
 library(tidyverse)
-library(lubridate)
 library(reactablefmtr)
+
+library(DBI)
+library(odbc)
+library(dbplyr)
 ```
 
 ```{r preparation}
 source("global.R", local = FALSE)
-rm(list = ls(pattern = "tbl", all.names = TRUE))
+
+con <- connect_to_db()
+
+get_references()
 
 date_start <- rollback(Sys.Date(), roll_to_first = TRUE) - months(1)
 date_finish <- date_start + months(1)
@@ -399,35 +407,45 @@ debt_finish_df <- debt_contract_finish %>%
     summarise(across(where(is.numeric), sum)) %>% 
     ungroup()
 
+distribution_stores <- unique(na.omit(ref_store$distribution_store))
 
 df_delivery <- delivery_data(date_start  + years(2000),
                              date_finish + years(2000)) %>% 
     filter(!is.na(nmbr_deliv_order),
            !direction %in% c("Багажка", "Закриття документів", "САМОВИВІЗ"),
-           to_intermediate == FALSE,
            is_not_delivered == FALSE) %>% 
     mutate(date_delivery = as.Date(date_delivery) - years(2000)) %>% 
     select(nmbr_delivery, date_delivery, nmbr_deliv_order, date_deliv_order,
-           store_name) %>% 
+           store_id, to_intermediate) %>% 
     distinct(nmbr_deliv_order, date_deliv_order, .keep_all = TRUE)
 
 df_delivery_order <- delivery_order_data(date_start  + years(2000) - months(2),
                                          date_finish + years(2000)) %>% 
     filter(!is.na(nmbr_sale_doc)) %>% 
-    select(nmbr_deliv_order, date_deliv_order, nmbr_sale_doc, date_sale_doc)
+    select(nmbr_deliv_order, date_deliv_order, nmbr_sale_doc, date_sale_doc,
+           intermediate_store)
 
-delivery_data <- df_delivery %>% 
+delivery_data_clr <- df_delivery %>% 
     left_join(df_delivery_order) %>% 
     filter(!is.na(nmbr_sale_doc)) %>% 
     mutate(date_sale_doc = as.Date(date_sale_doc) - years(2000)) %>% 
     left_join(select(sale_total, nmbr_sale_doc, date_sale_doc,
                      date_cust_order_doc, subdiv_name)) %>% 
     filter(!is.na(date_cust_order_doc)) %>% 
-    mutate(lead_time = as.integer(date_delivery - date_cust_order_doc))
+    left_join(ref_subdiv_category, by = "subdiv_name") %>% 
+    filter(!(to_intermediate == TRUE &
+                 subdiv_category %in% " Супермаркети  В2В" &
+                 store_id %in% distribution_stores)) %>% 
+    mutate(flag_intermediate = ifelse(to_intermediate == TRUE &
+                                          !subdiv_category %in% " Супермаркети  В2В",
+                                      1,
+                                      0),
+           lead_time = as.integer(date_delivery - date_cust_order_doc) +
+               flag_intermediate)
 
-total_lead_time <- round(mean(delivery_data$lead_time), 1)
+total_lead_time <- round(mean(delivery_data_clr$lead_time), 1)
 
-subdiv_lead_time <- delivery_data %>% 
+subdiv_lead_time <- delivery_data_clr %>% 
     group_by(subdiv_name) %>% 
     summarise(avr_lead_time = round(mean(lead_time), 1))
 
@@ -555,7 +573,7 @@ total_subdivs <- sale_df %>%
     nrow()
 ```
 
-``````{r sales_structure}
+```{r sales_structure}
 sale_month_type_data <- sale_month_group_raw %>% 
     group_by(customer_id) %>% 
     summarise(cust_sale = sum(cust_group_sum)) %>% 
@@ -733,7 +751,7 @@ g <- items_df %>%
     theme_minimal() +
     theme(#legend.direction = "vertical", 
           legend.position  = "top") +
-    labs(title = paste0("Загальна колькість проданих товарів - ", items_qty), 
+    labs(title = paste0("Загальна кількість проданих товарів - ", items_qty), 
          x = "Кількість SKU",
          y = "Частка у продажах",
          color = "ТОП-80%")
@@ -806,6 +824,9 @@ debt_subdiv <- debt_finish_df %>%
     pivot_longer(cols = 2:5,
                  names_to = "term",
                  values_to = "term_sum") %>% 
+    mutate(term_sum = ifelse(term_sum < 0,
+                             0,
+                             term_sum)) %>% 
     group_by(subdiv_name) %>% 
     mutate(prop = term_sum / sum(term_sum),
            lbl = scales::percent(prop, accuracy = 1),
@@ -819,6 +840,8 @@ total_debt <- round(sum(debt_customers_finish$debt_sum_finish) /1000000, 2)
 
 total_debt_discovered <- round(
     sale_df$total_debt_finish[sale_df$subdiv_name == "ВСЕГО"] / 1000000, 2)
+
+dbDisconnect(con)
 ```
 
  
@@ -1063,7 +1086,8 @@ sale_customer_segment %>%
     ggplot(aes(x = reorder(segment_form, segment_sale), y = segment_sale)) +
     geom_col(fill = "#048B9F") +
     geom_text(aes(label = paste0(round(sale_prop *100, 1),
-                                 "%"), y = segment_sale/2), size = 4) +
+                                 "%"), y = segment_sale/2),
+              size = 4, color = "white") +
     labs(x = "",
          y = "",
          title = "") +
@@ -1123,13 +1147,16 @@ sale_month_type_data %>%
 ```{r}
 top_segment <- sale_customer_segment$segment_form
 
+nb.cols <- length(top_segment)
+mycolors <- colorRampPalette(RColorBrewer::brewer.pal(7, "Blues"))(nb.cols)
+
 sale_month_type_data %>% 
     filter(segment_form %in% top_segment) %>% 
     ggplot(aes(x = segment_form, y = cust_sale, fill = segment_form)) +
     geom_boxplot() +
     geom_text(data = sale_customer_segment,
               aes(label = round(segment_avr_sale), y = segment_avr_sale)) +
-    scale_fill_brewer(palette = "Blues") +
+    scale_fill_manual(values = mycolors) +
     scale_y_log10(labels = scales::comma) +
     coord_flip() +
     labs(x = NULL,
@@ -1465,7 +1492,7 @@ store_data %>%
           axis.text.y = element_text(size = 7),
           legend.position = "top",
           legend.text.align = 0.8,
-          legend.spacing.x = unit(0.6, 'cm'))
+          legend.spacing.x = unit(0.5, 'cm'))
 ```
 
 
@@ -1552,7 +1579,7 @@ debt_subdiv %>%
           axis.title.x = element_text(size = 8),
           axis.text.y = element_text(size = 7),
           legend.position = "top",
-          legend.text.align = 0.8,
-          legend.spacing.x = unit(0.9, 'cm'))
+          legend.text.align = 0.4,
+          legend.spacing.x = unit(0.4, 'cm'))
 ```
 

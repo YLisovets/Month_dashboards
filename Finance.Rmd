@@ -2,6 +2,8 @@
 title: "Фінансовий звіт за `r lubridate::month(lubridate::rollback(Sys.Date()), label = TRUE, abbr = FALSE)`"
 output: 
   flexdashboard::flex_dashboard:
+    logo: "data/logo.png"
+    css: "custom.css"
     orientation: rows
     vertical_layout: scroll
     theme:
@@ -12,14 +14,20 @@ output:
 ```{r setup, include=FALSE}
 library(flexdashboard)
 library(tidyverse)
-library(lubridate)
 library(plotly)
 library(reactable)
+
+library(DBI)
+library(odbc)
+library(dbplyr)
 ```
 
 ```{r preparation}
 source("global.R", local = FALSE)
-rm(list = ls(pattern = "tbl", all.names = TRUE))
+
+con <- connect_to_db()
+
+get_references()
 
 date_start <-  rollback(Sys.Date(), roll_to_first = TRUE) - months(1) #as.Date("2022-02-01")
 date_finish <- date_start + months(1)
@@ -149,11 +157,11 @@ expenses_fn <- function(date_start, date_finish) {
         select(-c(type_exp, exp_vat:parent_2))
 
     expenses_df <- expenses_raw %>% 
-        group_by(subdiv_name, cost_item, expItems_name) %>% 
+        group_by(subdiv_name, subdiv_id, cost_item, expItems_name) %>% 
         summarise(expense_sum = sum(exp_sum, na.rm = TRUE)) %>% 
         ungroup() %>% 
-        left_join(select(distinct(ref_subdiv, subdiv_name, .keep_all = TRUE),
-                         subdiv_name, subdiv_parent)) %>% 
+        left_join(select(ref_subdiv, subdiv_id, subdiv_parent),
+                  by = "subdiv_id") %>% 
         left_join(select(delivery_vehicle, vehicle_subdiv_name,
                          vehicle_subdiv_service = subdiv_name),
                   by = c("subdiv_name" = "vehicle_subdiv_name")) %>% 
@@ -178,7 +186,7 @@ expenses_fn <- function(date_start, date_finish) {
             cost_item %in% c("08 Автовитрати, запчастини",
                              "09 Витрати на пальне",
                              "24 Страхування") &
-                parent_2 %in% c("Регіональні магазини",
+                parent_2 %in% c("Регіональні ма`газини",
                                 "КОРВЕТ")                 ~ "Витрати на збут",
             parent_2 %in% c("Регіональні магазини",
                             "КОРВЕТ")                     ~ "Витрати на збут",
@@ -285,11 +293,16 @@ sale_fn <- function(date_start, date_finish) {
         left_join(select(ref_projects, project_id, parent_project_id),
                   by = "project_id") %>% 
         mutate(project = case_when(
-            parent_project_id == "000000009" ~ "Сервис",
-            !is.na(nmbr_check_doc)           ~ "Розница",
+            parent_project_id %in% "000000009" |
+                (is.na(project_id) & !is.na(nmbr_refund_doc)) ~ "Сервис",
+            !is.na(nmbr_check_doc)                            ~ "Розница",
             project_id %in% c("000000003",
-                              "000000002")   ~ "Розница",
-            TRUE                             ~ "Прочее")) %>% 
+                              "000000002")                    ~ "Розница",
+            TRUE                                              ~ "Корректировка"),
+               subdiv_name = ifelse(project != "Корректировка",
+                                    subdiv_name,
+                                    "Відділ складської логістики")
+            ) %>% 
         group_by(subdiv_name, project) %>% 
         summarise(cost_sum = sum(item_sum, na.rm = TRUE) +
                              sum(item_vat, na.rm = TRUE)) %>% 
@@ -311,9 +324,9 @@ sale_fn <- function(date_start, date_finish) {
                   by = "project_id") %>%
         left_join(select(ref_items, item_id, item_name, parent_itemId)) %>% 
         mutate(project = ifelse(
-            parent_project_id == "000000009",
+            parent_project_id %in% "000000009",
             "Сервис",
-            ifelse(parent_itemId == "000000185",
+            ifelse(parent_itemId %in% "000000185",
                    ifelse(
                        str_detect(item_name,
                                   "(Відшкодування)|(Орендна плата)") &
@@ -322,11 +335,11 @@ sale_fn <- function(date_start, date_finish) {
                                "Відшкодування  вартості доставки товару"),
                        "Оренда",
                        item_name),
-                    ifelse(project == "Сотрудники" | 
-                               parent_project_id == "000000010",
+                    ifelse(project_id %in% "000000003" |                # Сотрудники 
+                               parent_project_id %in% "000000010",
                            "Розница",
                            project))),
-               organiz_id = ifelse(organiz_id == "000000001",
+              organiz_id = ifelse(organiz_id == "000000001",
                                    "korvet",
                                    "other")) %>% 
         group_by(subdiv_name, organiz_id, project) %>% 
@@ -334,7 +347,7 @@ sale_fn <- function(date_start, date_finish) {
                              sum(item_vat, na.rm = TRUE)) %>% 
         ungroup() %>%
         bind_rows(other_incom_data) %>% 
-        left_join(cost_df) %>%
+        full_join(cost_df) %>%
         group_by(subdiv_name, project) %>% 
         mutate(nrows = n(),
                cost_sum = ifelse(nrows == 1,
@@ -378,6 +391,14 @@ sales_month_fn <- function(data) {
                                     "000001035") ~ "Інші доходи",
                      TRUE                        ~ "Інші операц.доходи"
         )) %>%
+        mutate(sale_sum = ifelse(group == "Інші операц.доходи" &
+                                     !is.na(cost_sum),
+                                 -cost_sum,
+                                 sale_sum),
+               cost_sum = ifelse(group == "Інші операц.доходи" &
+                                     !is.na(cost_sum),
+                                 0,
+                                 cost_sum)) %>% 
         group_by(group) %>%
         summarise(income = sum(sale_sum, na.rm = TRUE),
                   goods_cost = - sum(cost_sum, na.rm = TRUE)) %>%
@@ -503,9 +524,9 @@ debt_customers_fn <- function(data) {
         left_join(select(ref_contract, contract_id, project_id)) %>% 
         left_join(select(ref_projects, project_id, parent_project_id)) %>% 
         filter(type_order == 1,
-               !customer_folder_id %in% c("000423140",
-                                          "001004385",
-                                          "000300700"),
+               !customer_folder_id %in% c("000423140",    # РЕГИОНАЛЬНЫЕ МАГАЗИНЫ
+                                          "001004385",    # КІНЦЕВИЙ ПОКУПЕЦЬ
+                                          "000300700"),   # СПЕЦИАЛИСТЫ
                !parent_id %in% c("000423140",
                                  "001004385",
                                  "000300700"),
@@ -953,12 +974,24 @@ cash_flow_raw <- cash_flow_data(date_start_year + years(2000),
                                                       "000000688"),
                "00015",
                ifelse(cf_item_id == "00014" & type_money_order == 0 &
-                          oco_responsible == "Куц Вікторія",
+                          oco_responsible %in% "Куц Вікторія",
                       "00099",
                       ifelse(cf_item_id == "00013" & type_money_order == 0 &
-                                 ico_responsible == "Куц Вікторія",
+                                 ico_responsible %in% "Куц Вікторія",
                              "00142",
-                             cf_item_id))))
+                             ifelse(cf_item_id == "00089" & # Інші доходи(Оренда)
+                                        partner_parent %in% "000423140",
+                                    "00147",
+                                    ifelse(cf_item_id == "00104" & # Оренда
+                                               partner_parent %in% "000423140",
+                                           "00147",
+                                           ifelse(cf_item_id == "00001" & # Оплата постач.
+                                                      partner_parent %in% "000423140",
+                                                 "00147",
+                                                 ifelse(cf_item_id == "00002" & # Оплата покуп.
+                                                            partner_parent %in% "000423140",
+                                                            "00147",
+                                                            cf_item_id))))))))
     ) %>% 
     filter(cf_item_id != "00147") %>% 
     mutate(cf_sum = ifelse(type_cf_order == 0,
@@ -972,13 +1005,16 @@ operating_activities_income <- c("00002",
                                  "00005",
                                  "00006",
                                  "00007",
+                                 "00013",
                                  "00018",
+                                 "00043",
                                  "00086",
                                  "00089",
                                  "00145",
-                                 "00148")
+                                 "00148",
+                                 "00180")
 
-investment_activities_income <- c("00132")
+investment_activities_income <- c("00132", "00133")
 investment_activities_outgo <- c("00090",
                                  "00095",
                                  "00029")
@@ -1001,7 +1037,7 @@ cash_flow_data <- cash_flow_raw %>%
             cf_item_id %in% c(operating_activities_income,
                               investment_activities_income,
                               financial_activities_income)  ~ "надходження",
-            TRUE                                                ~ "видаток"
+            TRUE                                            ~ "видаток"
         )
     ) %>% 
     group_by(month, type_activities, type_moving) %>% 
@@ -1031,12 +1067,47 @@ total_cash_flow <- cash_flow_operating +
     cash_flow_investment +
     cash_flow_financial
 
-cash_balance_start_month <- cash_balance_data(date_start + years(2000)) %>% 
-    summarise(total_balance = sum(acc_bal_grn)) %>% 
+money_in_way_start_month <- get_money_on_way(date_start) %>% 
+    mutate(type_cash = case_when(
+               organization_id == "000000001" ~ "Корвет безгот.",
+               .default = "Інші"
+           )) %>% 
+    select(type_cash, acc_bal_grn = balance_sum)
+
+cash_balance_start_month_data <- cash_balance_data(date_start + years(2000)) %>% 
+    mutate(type_cash = case_when(
+        organiz_id == "000000001" & type_acc == "безготівковий" ~ "Корвет безгот.",
+        .default = "Інші"
+    )) %>% 
+    select(type_cash, acc_bal_grn) %>% 
+    bind_rows(money_in_way_start_month) %>% 
+    group_by(type_cash) %>% 
+    summarise(type_sum = sum(acc_bal_grn))
+
+cash_balance_start_month <- cash_balance_start_month_data %>%     
+    summarise(total_balance = sum(type_sum)) %>% 
     pull()
 
-cash_balance_finish <- cash_balance_data(date_finish + years(2000)) %>% 
-    summarise(total_balance = sum(acc_bal_grn)) %>% 
+
+money_in_way_finish_month <- get_money_on_way(date_finish) %>% 
+    mutate(type_cash = case_when(
+               organization_id == "000000001" ~ "Корвет безгот.",
+               .default = "Інші"
+           )) %>% 
+    select(type_cash, acc_bal_grn = balance_sum)
+
+cash_balance_finish_data <- cash_balance_data(date_finish + years(2000)) %>% 
+    mutate(type_cash = case_when(
+        organiz_id == "000000001" & type_acc == "безготівковий" ~ "Корвет безгот.",
+        .default = "Інші"
+    )) %>% 
+    select(type_cash, acc_bal_grn) %>% 
+    bind_rows(money_in_way_start_month) %>% 
+    group_by(type_cash) %>% 
+    summarise(type_sum = sum(acc_bal_grn))
+
+cash_balance_finish <- cash_balance_finish_data %>% 
+    summarise(total_balance = sum(type_sum)) %>% 
     pull()
 
 cash_flow_df <- cash_flow_current_month %>% 
@@ -1112,8 +1183,8 @@ cash_flow_tbl <- cash_flow_df %>%
                                 sponsored_cur_month),
             .after = 7) %>% 
     filter(!(item %in% c("Поповнення обігових коштів",
-                       "Виплата дівідендів",
-                       "Спонсорська допомога") &
+                         "Виплата дівідендів",
+                         "Спонсорська допомога") &
                sum_moving == 0)) %>% 
     mutate(sum_moving = round(sum_moving / 1000, 1))
 
@@ -1123,9 +1194,13 @@ cash_flow_tbl <- cash_flow_tbl %>%
     add_row(item = "Грошові кошти на початок",
             sum_moving = round(cash_balance_start_month / 1000, 1),
             .before = 1) %>% 
+    add_row(item = "   у т.ч. на рах.Корвет",
+            sum_moving = round(cash_balance_start_month_data$type_sum[2] / 1000, 1),
+            .before = 2) %>%
     add_row(item = "Грошові кошти на кінець",
-            sum_moving = round(cash_balance_finish / 1000, 1),
-            .after = cash_flow_nrow + 1)
+            sum_moving = round(cash_balance_finish / 1000, 1)) %>% 
+    add_row(item = "   у т.ч. на рах.Корвет",
+            sum_moving = round(cash_balance_finish_data$type_sum[2] / 1000, 1))
 
 cash_flow_start_year <- cash_flow_data %>%
     group_by(type_activities, type_moving) %>% 
@@ -1145,8 +1220,25 @@ total_cash_flow_year <- cash_flow_operating_year +
     cash_flow_investment_year +
     cash_flow_financial_year
 
-cash_balance_start_year <- cash_balance_data(date_start_year + years(2000)) %>% 
-    summarise(total_balance = sum(acc_bal_grn)) %>% 
+money_in_way_start_year <- get_money_on_way(date_start_year) %>% 
+    mutate(type_cash = case_when(
+               organization_id == "000000001" ~ "Корвет безгот.",
+               .default = "Інші"
+           )) %>% 
+    select(type_cash, acc_bal_grn = balance_sum)
+
+cash_balance_start_year_data <- cash_balance_data(date_start_year + years(2000)) %>% 
+    mutate(type_cash = case_when(
+        organiz_id == "000000001" & type_acc == "безготівковий" ~ "Корвет безгот.",
+        .default = "Інші"
+    )) %>% 
+    select(type_cash, acc_bal_grn) %>% 
+    bind_rows(money_in_way_start_month) %>% 
+    group_by(type_cash) %>% 
+    summarise(type_sum = sum(acc_bal_grn))
+
+cash_balance_start_year <- cash_balance_start_year_data %>%    
+    summarise(total_balance = sum(type_sum)) %>% 
     pull()
 
 sponsored_year <- cash_flow_raw %>% 
@@ -1243,13 +1335,13 @@ fin_cycle_data <- tibble(date = date_for_balance) %>%
 
 purchases_current_month <- purchases_data(date_start + years(2000),
                                       date_finish + years(2000)) %>% 
-    filter(!str_detect(contract_name, "^685")) %>% 
+    filter(!str_detect(contract_name, "6851")) %>% 
     summarise(total_sum = sum(item_sum) + sum(item_vat)) %>% 
     pull()
 
 purchases_year <- purchases_data(date_start_year + years(2000),
                                       date_finish + years(2000)) %>% 
-    filter(!str_detect(contract_name, "^685")) %>% 
+    filter(!str_detect(contract_name, "6851")) %>% 
     summarise(total_sum = sum(item_sum) + sum(item_vat)) %>% 
     pull()
 
@@ -1592,6 +1684,7 @@ subdiv_profit_year <- sales_current_year_data %>%
                TRUE                 ~ "normal"
            ))
 
+dbDisconnect(con)
 ```
 
 
@@ -1746,8 +1839,9 @@ profitability %>%
                                                    accuracy = 0.1))) +
     geom_col(aes(y = `Дохід від осн.діяльн.`, fill = "Продаж")) +
     geom_col(aes(y = `Чистий прибуток`, fill = result)) +
-    geom_text(aes(y = `Чистий прибуток`), vjust = -0.5, size = 4.5) +
-    scale_y_continuous(label = scales::comma) +
+    geom_text(aes(y = `Чистий прибуток`), vjust = -0.5, size = 3.5) +
+    scale_y_continuous(labels = scales::label_number(
+        scale_cut = scales::cut_short_scale())) +
     labs(x = "", y = "", fill = "") +
     theme_minimal() +
     theme(legend.position = "top",
@@ -1772,6 +1866,10 @@ expenses_vis %>%
                           levels = c("Фінансові витрати",
                                      "Адміністр.витрати",
                                      "Логістичні витрати",
+                                     "Витрати на збут"),
+                          labels = c("Фінанс.витрати",
+                                     "Адміністр.витрати",
+                                     "Логіст.витрати",
                                      "Витрати на збут")),
            month = factor(month, levels = c("Січ",
                                             "Лют",
@@ -1789,8 +1887,9 @@ expenses_vis %>%
                y = total_sum,
                fill = group)) +
     geom_col(position = "stack") +
-    scale_fill_brewer(palette = 2) +
-    scale_y_continuous(label = scales::comma) +
+    scale_fill_brewer(palette = "Blues") +
+    scale_y_continuous(labels = scales::label_number(
+        scale_cut = scales::cut_short_scale())) +
     theme_minimal() +
     labs(y = "",
          fill = "",
@@ -1799,9 +1898,10 @@ expenses_vis %>%
     theme(legend.text = element_text(size = 8),
           axis.text.x = element_text(size = 9),
           axis.text.y = element_text(size = 9),
+          panel.grid.major.x = element_blank(),
           legend.position = "top",
-          legend.text.align = 0.3,
-          legend.spacing.x = unit(0.4, 'cm'))
+          legend.text.align = 0.1,
+          legend.spacing.x = unit(0.2, 'cm'))
 ```
 
 Row {data-height=650}
@@ -1882,7 +1982,7 @@ cash_flow_tbl %>%
         defaultColDef = colDef(
             align = "left",
             headerStyle = list(background = "grey"),
-            style = list(fontSize = '20px')),
+            style = list(fontSize = '18px')),
         columns = list(
             item = colDef(name = ""),
             sum_moving = colDef(name = "", align = "right",
@@ -1891,7 +1991,7 @@ cash_flow_tbl %>%
                                                   digits = 1)
         )),
         rowStyle = function(index) {
-            if (index %in% c(2, 5, 6, cash_flow_nrow+1)) 
+            if (index %in% c(3, 6, 7, cash_flow_nrow+2)) 
                 list(fontWeight = "bold",
                      background = "gainsboro")
         }
